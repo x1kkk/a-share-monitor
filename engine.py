@@ -306,6 +306,12 @@ def self_check() -> None:
     assert parse_quote(auction_row).volume == 0
     assert parse_quote({**auction_row, "f5": -1}) is None
     assert parse_quote({**auction_row, "f3": "-"}) is None
+    placeholders = {**auction_row, **{key: "-" for key in ("f5", "f6", "f62", "f66", "f72")}}
+    auction = now.replace(hour=9, minute=20)
+    parsed = parse_quote(placeholders, now=auction)
+    assert parsed is not None and parsed.volume == 0 and parsed.main_inflow == 0
+    assert parse_quote(placeholders, now=auction.replace(minute=30)) is None
+    assert parse_quote({**placeholders, "f5": 100}, now=auction) is None
     from fetcher import Simulator
     from notifier import Notifier
     from pre_market import MarketCalendar

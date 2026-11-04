@@ -59,10 +59,21 @@ class Book:
     ts: float
 
 
-def parse_quote(row: dict) -> Quote | None:
+def parse_quote(row: dict, *, now: datetime | None = None) -> Quote | None:
     code, name = str(row.get("f12", "")), str(row.get("f14", "")).strip()
     if not re.fullmatch(r"(?:60|00)\d{4}", code) or not name or "ST" in name.upper():
         return None
+    snapshot_time = (now or datetime.now(SHANGHAI)).astimezone(SHANGHAI)
+    minute = snapshot_time.hour * 60 + snapshot_time.minute
+    # During auction Eastmoney uses '-' (not numeric zero) before the first
+    # trade. Only normalize absent counters for genuinely untraded quotes;
+    # missing flows on a traded quote remain invalid below.
+    missing = (None, "", "-")
+    if 555 <= minute < 570 and (row.get("f5") in missing or number(row.get("f5"), -1) == 0):
+        row = dict(row)
+        for key in ("f5", "f6", "f8", "f62", "f66", "f72"):
+            if row.get(key) in missing:
+                row[key] = 0
     price, volume, previous = number(row.get("f2")), number(row.get("f5"), -1), number(row.get("f18"))
     # Indicative auction prices are valid before the first trade (volume == 0).
     if price <= 0 or volume < 0 or previous <= 0:
@@ -158,7 +169,8 @@ class Fetcher:
             codes = [str(row.get("f12", "")) for row in rows]
             if len(rows) != total or len(set(codes)) != total:
                 raise ValueError("incomplete or duplicated market pages")
-            quotes = [q for row in rows if (q := parse_quote(row)) is not None]
+            snapshot_time = datetime.now(SHANGHAI)
+            quotes = [q for row in rows if (q := parse_quote(row, now=snapshot_time)) is not None]
             if not quotes:
                 raise ValueError("no tradable main-board quotes")
             self.last_raw = quotes
