@@ -1,0 +1,258 @@
+"""Asynchronous quote adapters and a labelled, reproducible off-hours simulator."""
+from __future__ import annotations
+
+import asyncio
+import logging
+import math
+import random
+import re
+from dataclasses import dataclass, replace
+from datetime import date, datetime
+from decimal import Decimal, ROUND_HALF_UP
+
+import httpx
+
+from config import Settings, SHANGHAI
+from pre_market import MarketCalendar
+
+log = logging.getLogger(__name__)
+
+
+def number(value: object, default: float = 0.0) -> float:
+    try:
+        result = float(value)
+        return result if math.isfinite(result) else default
+    except (ValueError, TypeError):
+        return default
+
+
+def limit_price(pre_close: float) -> float:
+    return float((Decimal(str(pre_close)) * Decimal("1.10")).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP))
+
+
+@dataclass(frozen=True)
+class Quote:
+    code: str
+    name: str
+    price: float
+    pct: float
+    volume: float
+    amount: float
+    turnover: float
+    pre_close: float
+    float_cap: float
+    listed: date | None
+    main_inflow: float
+    super_inflow: float
+    large_inflow: float
+    industry: str = ""
+    raw_tags: str = ""
+    high: float = 0.0
+    source_ts: float | None = None
+
+
+@dataclass(frozen=True)
+class Book:
+    price: float
+    buy_lots: float
+    sell_lots: float
+    ts: float
+
+
+def parse_quote(row: dict) -> Quote | None:
+    code, name = str(row.get("f12", "")), str(row.get("f14", "")).strip()
+    if not re.fullmatch(r"(?:60|00)\d{4}", code) or not name or "ST" in name.upper():
+        return None
+    price, volume, previous = number(row.get("f2")), number(row.get("f5"), -1), number(row.get("f18"))
+    # Indicative auction prices are valid before the first trade (volume == 0).
+    if price <= 0 or volume < 0 or previous <= 0:
+        return None
+    # A missing cash-flow field must not turn yesterday's negative value into fake inflow.
+    if any(not math.isfinite(number(row.get(key), math.nan))
+           for key in ("f3", "f6", "f8", "f21", "f62", "f66", "f72")):
+        return None
+    try:
+        listed = datetime.strptime(str(row.get("f26", "")), "%Y%m%d").date()
+    except ValueError:
+        listed = None
+    return Quote(
+        code, name, price, number(row.get("f3")), volume, number(row.get("f6")),
+        number(row.get("f8")), previous, number(row.get("f21")), listed,
+        number(row.get("f62")), number(row.get("f66")), number(row.get("f72")),
+        str(row.get("f100") or ""), str(row.get("f103") or ""),
+        number(row.get("f15")), number(row.get("f124")) or None,
+    )
+
+
+def parse_books(text: str) -> dict[str, Book]:
+    result = {}
+    for code, body in re.findall(r'v_(?:sh|sz)(\d{6})="([^"]*)"', text):
+        fields = body.split("~")
+        if len(fields) <= 30:
+            continue
+        try:
+            ts = datetime.strptime(fields[30], "%Y%m%d%H%M%S").replace(tzinfo=SHANGHAI).timestamp()
+            price, buy, sell = (number(fields[i], -1) for i in (3, 10, 20))
+            if price > 0 and buy >= 0 and sell >= 0:
+                result[code] = Book(price, buy, sell, ts)
+        except ValueError:
+            continue
+    return result
+
+
+class Fetcher:
+    def __init__(self, client: httpx.AsyncClient, cfg: Settings):
+        self.client, self.cfg = client, cfg
+        self.semaphore = asyncio.Semaphore(cfg.max_concurrency)
+        self.last_raw: list[Quote] = []
+        self.last_total: int | None = None
+
+    async def _page(self, page: int, request_timeout: float | None = None) -> tuple[int, list[dict]]:
+        params = {"pn": page, "pz": self.cfg.page_size, "po": 0, "np": 1,
+                  "ut": "bd1d9ddb04089700cf9c27f6f7426281",
+                  "fltt": 2, "invt": 2, "fid": "f12", "fs": self.cfg.market_filter,
+                  "fields": self.cfg.fields}
+        async with self.semaphore:
+            response = await self.client.get(self.cfg.eastmoney_url, params=params,
+                                             timeout=request_timeout or self.cfg.http_timeout)
+            response.raise_for_status()
+        payload = response.json()
+        data = payload.get("data") if isinstance(payload, dict) else None
+        if not isinstance(data, dict) or not isinstance(data.get("diff"), list):
+            raise ValueError("Eastmoney response has no diff list")
+        if any(not isinstance(row, dict) for row in data["diff"]):
+            raise ValueError("invalid quote row")
+        try:
+            total = int(data.get("total", 0))
+        except (ValueError, TypeError) as exc:
+            raise ValueError("invalid market total") from exc
+        return total, data["diff"]
+
+    async def fetch_market(self, *, bootstrap: bool = False) -> list[Quote]:
+        # Reject partial/duplicate pages; never feed a partial market into percentiles.
+        deadline = self.cfg.bootstrap_deadline if bootstrap else self.cfg.eastmoney_deadline
+        request_timeout = self.cfg.bootstrap_http_timeout if bootstrap else self.cfg.http_timeout
+        async with asyncio.timeout(deadline):
+            if self.last_total is None:
+                total, first = await self._page(1, request_timeout)
+                pages = [(total, first)]
+                start_page = 2
+            else:
+                total, pages, start_page = self.last_total, [], 1
+            if total <= 0:
+                raise ValueError("empty market snapshot")
+            page_count = math.ceil(total / self.cfg.page_size)
+            if page_count > self.cfg.max_pages:
+                raise ValueError("unexpected market size")
+            pages += await asyncio.gather(*(self._page(p, request_timeout) for p in range(start_page, page_count + 1)),
+                                          return_exceptions=True)
+            rows = []
+            for page in pages:
+                if isinstance(page, BaseException):
+                    raise page
+                other_total, batch = page
+                if other_total != total:
+                    self.last_total = None
+                    raise ValueError("market universe changed during pagination")
+                rows.extend(batch)
+            codes = [str(row.get("f12", "")) for row in rows]
+            if len(rows) != total or len(set(codes)) != total:
+                raise ValueError("incomplete or duplicated market pages")
+            quotes = [q for row in rows if (q := parse_quote(row)) is not None]
+            if not quotes:
+                raise ValueError("no tradable main-board quotes")
+            self.last_raw = quotes
+            self.last_total = total
+            return quotes
+
+    async def fetch_books(self, codes: set[str], now: datetime) -> dict[str, Book]:
+        if not codes:
+            return {}
+
+        async def batch(items: list[str]) -> dict[str, Book]:
+            symbols = ",".join(("sh" if c.startswith("60") else "sz") + c for c in items)
+            async with self.semaphore:
+                response = await self.client.get(self.cfg.tencent_url + symbols)
+                response.raise_for_status()
+            books = parse_books(response.content.decode("gb18030", errors="replace"))
+            return {code: book for code, book in books.items()
+                    if code in items and abs(now.timestamp() - book.ts) <= 15}
+
+        try:
+            async with asyncio.timeout(self.cfg.book_deadline):
+                ordered = sorted(codes)
+                results = await asyncio.gather(*(batch(ordered[i:i + 80]) for i in range(0, len(ordered), 80)),
+                                               return_exceptions=True)
+                for result in results:
+                    if isinstance(result, BaseException):
+                        raise result
+                return {code: book for group in results for code, book in group.items()}
+        except (httpx.HTTPError, TimeoutError, ValueError):
+            log.warning("腾讯盘口超时/异常：本轮封单指标为空，不沿用旧盘口")
+            return {}
+
+
+def eligible(quotes: list[Quote], calendar: MarketCalendar, today: date, cfg: Settings) -> list[Quote]:
+    return [q for q in quotes if calendar.listing_is_mature(q.listed, today, cfg.minimum_listing_sessions)]
+
+
+def demo_seed() -> list[Quote]:
+    # Real codes/names only; ALL prices, dates, volumes and cash flows below are fictional.
+    stocks = [("600000", "浦发银行"), ("600036", "招商银行"), ("600519", "贵州茅台"),
+              ("601318", "中国平安"), ("601398", "工商银行"), ("601857", "中国石油"),
+              ("601888", "中国中免"), ("603259", "药明康德"), ("000001", "平安银行"),
+              ("000002", "万科A"), ("000333", "美的集团"), ("000651", "格力电器"),
+              ("000858", "五粮液"), ("002415", "海康威视"), ("002594", "比亚迪"),
+              ("003816", "中国广核"), ("600276", "恒瑞医药"), ("601166", "兴业银行"),
+              ("600030", "中信证券"), ("601012", "隆基绿能"), ("600309", "万华化学"),
+              ("601899", "紫金矿业"), ("002475", "立讯精密"), ("600900", "长江电力")]
+    return [Quote(code, name, 10.0 + i, 0.0, 100000, 1e8, 1.0, 10.0 + i,
+                  1e10, date(2010, 1, 1), 0.0, 0.0, 0.0, "演示行业", "", 10.0 + i)
+            for i, (code, name) in enumerate(stocks)]
+
+
+class Simulator:
+    def __init__(self, seeds: list[Quote], cfg: Settings, source: str):
+        self.rng = random.Random(cfg.mock_seed)
+        self.source = source
+        self.base = {q.code: q for q in seeds}
+        self.current = dict(self.base)
+        self.tick = 0
+        codes = list(self.base)
+        self.cohort = self.rng.sample(codes, min(cfg.mock_cohort, len(codes)))
+        self.sealed = set(self.cohort[:max(1, len(self.cohort) // 2)])
+
+    def step(self, now: datetime) -> tuple[list[Quote], dict[str, Book]]:
+        self.tick += 1
+        # First tick is the baseline. Then a random subset rises by 0.8%-2.5%.
+        phase = self.tick % 240
+        stimulated = self.rng.sample(self.cohort, min(3, len(self.cohort))) if 2 <= phase <= 14 else []
+        books = {}
+        for code, base in self.base.items():
+            old = self.current[code]
+            ceiling = limit_price(base.pre_close)
+            price, flow = old.price, old.main_inflow
+            if code in self.cohort and (self.tick == 1 or phase == 0):
+                price = round(base.pre_close * 0.99, 2)
+                flow = 0.0
+            elif code in stimulated:
+                price = min(round(price + base.pre_close * self.rng.uniform(0.008, 0.025), 2), ceiling - 0.01)
+                flow += self.rng.uniform(2e6, 12e6)
+            if code in self.sealed and 16 <= phase <= 20:
+                price = ceiling
+                flow += 8e6
+            elif code in self.sealed and phase == 21:
+                price = round(ceiling - base.pre_close * 0.015, 2)
+            elif code in self.sealed and 25 <= phase <= 30:
+                price = ceiling
+            elif code in self.sealed and phase == 31:
+                price = round(ceiling - base.pre_close * 0.02, 2)
+            # Afterwards hold steady: unsealed anomalies can turn gray and disappear.
+            q = replace(base, price=price, pct=round((price / base.pre_close - 1) * 100, 4),
+                        main_inflow=flow, super_inflow=flow * 0.6, large_inflow=flow * 0.4,
+                        amount=base.amount + self.tick * 1e5, volume=base.volume + self.tick * 100,
+                        high=max(old.high, price), source_ts=now.timestamp())
+            self.current[code] = q
+            books[code] = Book(price, self.rng.randint(1000, 30000) if price >= ceiling else 100,
+                               0 if price >= ceiling else 500, now.timestamp())
+        return list(self.current.values()), books

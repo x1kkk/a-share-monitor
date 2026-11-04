@@ -1,0 +1,16 @@
+.venv/
+.pip-cache/
+__pycache__/
+pip-build-tracker-*/
+pip-ephem-wheel-cache-*/
+pip-install-*/
+.env
+.env.*
+!.env.example
+*.log
+frontend/node_modules/
+frontend/dist/
+frontend/preview-*.jpg
+backend_audit_results.json
+backend_ws_capture.json
+后端实现与自检报告.md

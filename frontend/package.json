@@ -1,0 +1,9 @@
+{
+  "name": "a-share-monitor",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": { "dev": "vite --configLoader native --host 127.0.0.1", "build": "vite build --configLoader native", "preview": "vite preview --configLoader native --host 127.0.0.1", "test": "node --test src/logic.test.js" },
+  "dependencies": { "vue": "^3.5.0" },
+  "devDependencies": { "@vitejs/plugin-vue": "^6.0.0", "vite": "^7.0.0", "tailwindcss": "^4.1.0", "@tailwindcss/vite": "^4.1.0" }
+}
