@@ -14,3 +14,6 @@ frontend/preview-*.jpg
 backend_audit_results.json
 backend_ws_capture.json
 后端实现与自检报告.md
+
+watchlist.json
+.watchlist-*.tmp

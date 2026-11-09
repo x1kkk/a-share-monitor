@@ -36,7 +36,13 @@ export function eventGate(limit = 2000) {
   }
 }
 // Accept snapshots in the provider's order; cloning never sorts or removes rows.
-export function snapshotRows(snapshot) { return { anomalies: Array.isArray(snapshot.anomalies) ? [...snapshot.anomalies] : [], leaders: Array.isArray(snapshot.leaders) ? [...snapshot.leaders] : [] } }
+export function snapshotRows(snapshot) {
+  return Object.fromEntries(['anomalies', 'leaders', 'watchlist_anomalies', 'watchlist_leaders'].map(key => [key, Array.isArray(snapshot[key]) ? [...snapshot[key]] : []]))
+}
+export function alertQueue(current, events, now = Date.now()) {
+  return [...events.map(event => ({ ...event, expires: now + (event.is_watchlist ? 12000 : 7000) })), ...current.filter(event => event.expires > now)]
+    .sort((a, b) => Number(Boolean(b.is_watchlist)) - Number(Boolean(a.is_watchlist)) || b.expires - a.expires).slice(0, 6)
+}
 // Only one request is in flight. Edits arriving during a save coalesce to the newest draft.
 export function serialLatest(save) {
   let running = false, pending = null

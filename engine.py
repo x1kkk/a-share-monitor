@@ -56,11 +56,16 @@ class Engine:
         self.minute_count = 0
         self.day = None
         self.rows: dict[str, dict] = {}
+        self.watchlist: set[str] = set()
+        self.watchlist_events: OrderedDict[str, Entry] = OrderedDict()
+        self.watchlist_kinds: dict[str, str] = {}
+        self.watchlist_condition: dict[str, bool] = {}
 
     def clear_windows(self) -> None:
         self.histories.clear()
         self.previous_condition.clear()
         self.pending.clear()
+        self.watchlist_condition.clear()
 
     def set_weights(self, weights: dict[str, float]) -> None:
         if set(weights) != set(DEFAULT_WEIGHTS):
@@ -84,6 +89,26 @@ class Engine:
                               "status": "active" if age < self.cfg.active_seconds else "expired"})
         return board
 
+    def watchlist_board(self, clock: float | None = None) -> list[dict]:
+        clock = time.monotonic() if clock is None else clock
+        board = []
+        for code, entry in list(self.watchlist_events.items()):
+            age = max(0, clock - entry.entered_clock)
+            if code not in self.watchlist or age >= 300:
+                del self.watchlist_events[code]
+                self.watchlist_kinds.pop(code, None)
+            elif code in self.rows:
+                board.append({**self.rows[code], "is_watchlist": True,
+                              "event_type": self.watchlist_kinds[code], "entered_at": entry.entered_at,
+                              "age_seconds": round(age, 2), "status": "active" if age < 120 else "expired"})
+        return board
+
+    def watchlist_rows(self) -> list[dict]:
+        rows = [{**self.rows[code], "is_watchlist": True} if code in self.rows else
+                {"code": code, "name": code, "quote_missing": True, "is_watchlist": True}
+                for code in sorted(self.watchlist)]
+        return sorted(rows, key=lambda row: (not row.get("is_limit_up", False), row["code"]))
+
     @property
     def touched_codes(self) -> set[str]:
         return {code for code, state in self.limits.items() if state.touched}
@@ -95,12 +120,14 @@ class Engine:
         clock = time.monotonic() if clock is None else clock
         if self.day != now.date():
             weights = self.weights.copy()
+            watchlist = self.watchlist.copy()
             self.__init__(self.cfg)
             self.weights, self.day = weights, now.date()
+            self.watchlist = watchlist
         minute = now.strftime("%Y%m%d%H%M")
         if minute != self.minute:
             self.minute, self.minute_count = minute, 0
-        events, rows = [], {}
+        events, rows, vip_signals = [], {}, set()
         codes = {q.code for q in quotes}
         for code in list(self.anomalies):
             if clock - self.anomalies[code].entered_clock >= self.cfg.remove_seconds:
@@ -113,7 +140,8 @@ class Engine:
         def event(kind: str, q: Quote, **extra: object) -> None:
             events.append({"code": q.code, "name": q.name, "event_type": kind,
                            "time": now.isoformat(), "price": q.price, "pct": q.pct,
-                           "simulated": simulated, **extra})
+                           "simulated": simulated, "is_watchlist": q.code in self.watchlist,
+                           "priority": "vip" if q.code in self.watchlist else "normal", **extra})
 
         for q in quotes:
             history = self.histories.setdefault(q.code, deque(maxlen=60))
@@ -159,6 +187,7 @@ class Engine:
             row = asdict(q)
             row["listed"] = q.listed.isoformat() if q.listed else None
             row.update({"speed_2m": round(speed, 6), "inflow_2m": inflow,
+                        "is_watchlist": q.code in self.watchlist,
                         "window_seconds": round(clock - old[0], 2), "limit_up_price": ceiling,
                         "is_limit_up": sealed, "at_limit_price": at_limit, "ever_limit_up": state.touched,
                         "first_seal_time": datetime.fromtimestamp(state.first_seal_ts, SHANGHAI).isoformat()
@@ -180,6 +209,14 @@ class Engine:
                         "simulated": simulated})
             rows[q.code] = row
             qualifies = speed >= 2.0 - 1e-9 and inflow > 0 and not at_limit
+            if q.code in self.watchlist:
+                # VIP radar is independent of ordinary admission and its 420s clock.
+                qualifies = speed >= 2.0 - 1e-9 and q.main_inflow > 0 and not at_limit
+                if qualifies and not self.watchlist_condition.get(q.code, False):
+                    vip_signals.add(q.code)
+                    if q.code not in self.anomalies:
+                        self.pending.add(q.code)
+                self.watchlist_condition[q.code] = qualifies
             if qualifies and not self.previous_condition.get(q.code, False) and q.code not in self.anomalies:
                 self.pending.add(q.code)
             if not qualifies:
@@ -192,22 +229,35 @@ class Engine:
             row["score"] = round(sum(ranks[m][code] * w / 100 for m, w in self.weights.items()), 2)
         candidates = sorted((c for c in self.pending if c in rows and c not in self.anomalies),
                             key=lambda c: (-rows[c]["score"], c))
-        accepted = candidates[:max(0, self.cfg.max_new_per_minute - self.minute_count)]
+        vip = [c for c in candidates if c in self.watchlist]
+        ordinary = [c for c in candidates if c not in self.watchlist]
+        normal = ordinary[:max(0, self.cfg.max_new_per_minute - self.minute_count)]
+        accepted = vip + normal
         # Reverse insertion keeps the strongest of a simultaneous batch at the top.
         for code in reversed(accepted):
             self.anomalies[code] = Entry(clock, now.isoformat())
             self.anomalies.move_to_end(code, last=False)
             self.pending.discard(code)
-        self.minute_count += len(accepted)
+        self.minute_count += len(normal)
         by_code = {q.code: q for q in quotes}
         for code in accepted:
+            if code not in self.watchlist:
+                event("anomaly", by_code[code], score=rows[code]["score"],
+                      speed_2m=rows[code]["speed_2m"], inflow_2m=rows[code]["inflow_2m"])
+        for code in sorted(vip_signals, key=lambda code: (-rows[code]["score"], code)):
             event("anomaly", by_code[code], score=rows[code]["score"],
                   speed_2m=rows[code]["speed_2m"], inflow_2m=rows[code]["inflow_2m"])
         # Missing a code is not evidence of expiry or a limit-up. Keep its last
         # displayed values without feeding stale rows into fresh-market ranks.
         retained = {code: {**self.rows[code], "quote_missing": True}
-                    for code in self.anomalies if code not in rows and code in self.rows}
+                    for code in set(self.anomalies) | self.watchlist if code not in rows and code in self.rows}
         self.rows = {**retained, **rows}
+        for item in reversed(events):
+            code = item["code"]
+            if item["is_watchlist"]:
+                self.watchlist_events[code] = Entry(clock, now.isoformat())
+                self.watchlist_events.move_to_end(code, last=False)
+                self.watchlist_kinds[code] = item["event_type"]
         board = self.anomaly_board(clock)
         sealed = sorted((row for row in rows.values() if row["is_limit_up"]),
                         key=lambda row: (row["first_seal_ts"], row["code"]))
@@ -217,6 +267,8 @@ class Engine:
         leaders = sealed + others[:max(0, 150 - len(sealed))]
         return {"type": "snapshot", "time": now.isoformat(), "simulated": simulated,
                 "stock_count": len(rows), "anomalies": board, "leaders": leaders,
+                "watchlist_anomalies": self.watchlist_board(clock),
+                "watchlist_leaders": self.watchlist_rows(),
                 "weights": self.weights.copy(), "events": events,
                 "minute_admitted": self.minute_count, "pending_count": len(self.pending)}
 

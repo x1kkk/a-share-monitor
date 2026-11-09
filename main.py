@@ -4,8 +4,13 @@ from __future__ import annotations
 import asyncio
 import hmac
 import logging
+import json
+import os
+import re
+import tempfile
 import time
 from contextlib import asynccontextmanager
+from dataclasses import asdict
 from datetime import datetime
 from pathlib import Path
 
@@ -29,7 +34,7 @@ log = logging.getLogger(__name__)
 
 
 class Monitor:
-    def __init__(self, client: httpx.AsyncClient, cfg: Settings):
+    def __init__(self, client: httpx.AsyncClient, cfg: Settings, *, watchlist_path: Path | None = None):
         self.cfg = cfg
         self.fetcher = Fetcher(client, cfg)
         self.calendar = MarketCalendar()
@@ -44,9 +49,55 @@ class Monitor:
         self.last_success_clock: float | None = None
         self.snapshot = {"type": "snapshot", "status": "initializing", "events": [],
                          "anomalies": [], "leaders": [], "stock_count": 0}
+        self.watchlist_path = watchlist_path or Path(__file__).resolve().parent / "watchlist.json"
+        try:
+            codes = json.loads(self.watchlist_path.read_text(encoding="utf-8"))
+            if not isinstance(codes, list) or any(not isinstance(c, str) or not re.fullmatch(r"(?:00|60)[0-9]{4}", c) for c in codes):
+                raise ValueError("invalid watchlist.json; refusing to overwrite")
+        except FileNotFoundError:
+            codes = []
+        for engine in self.engines.values():
+            engine.watchlist = set(codes)
+        self.snapshot.update(watchlist_anomalies=[], watchlist_leaders=self.engines["mock"].watchlist_rows())
         self.sequence = 0
         self.calendar_task: asyncio.Task | None = None
         self.calendar_retry_at = 0.0
+        if not self.watchlist_path.exists():
+            self.save_watchlist(set(codes))
+
+    def save_watchlist(self, codes: set[str], initial: dict | None = None) -> None:
+        # Single-process API handlers have no awaits between atomic persistence and state update.
+        temporary = None
+        try:
+            with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=self.watchlist_path.parent,
+                                             prefix=".watchlist-", suffix=".tmp", delete=False) as stream:
+                temporary = stream.name
+                json.dump(sorted(codes), stream)
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(temporary, self.watchlist_path)
+        finally:
+            if temporary and os.path.exists(temporary):
+                os.unlink(temporary)
+        for engine in self.engines.values():
+            removed = engine.watchlist - codes
+            for code in removed:
+                engine.watchlist_events.pop(code, None)
+                engine.watchlist_kinds.pop(code, None)
+                engine.watchlist_condition.pop(code, None)
+            engine.watchlist = set(codes)
+            for row in engine.rows.values():
+                row["is_watchlist"] = row["code"] in codes
+        engine = self.engines.get(self.mode, self.engines["live"])
+        if initial and initial["code"] not in engine.rows:
+            engine.rows[initial["code"]] = initial
+        self.broadcast({**self.snapshot, "events": [], "watchlist_leaders": engine.watchlist_rows(),
+                        "watchlist_anomalies": engine.watchlist_board()})
+
+    def eligible_stocks(self):
+        # Validate against real metadata, never synthetic simulation seed dates.
+        now = datetime.now(SHANGHAI)
+        return eligible(self.fetcher.last_raw, self.calendar, now.date(), self.cfg)
 
     def health(self) -> dict:
         return {"status": self.snapshot.get("status", "initializing"), "mode": self.mode,
@@ -153,6 +204,7 @@ class Monitor:
                     aged = self.engines[mode].anomaly_board() if mode in self.engines else []
                     self.broadcast({**self.snapshot, "status": status, "mode": mode, "events": [],
                                     "anomalies": aged,
+                                    "watchlist_anomalies": self.engines[mode].watchlist_board() if mode in self.engines else [],
                                     "error": str(exc) if isinstance(exc, ValueError) else type(exc).__name__,
                                     "last_attempt": now.isoformat()})
                     log.warning("本轮不可用 mode=%s error=%s；未推进行情状态机", mode, type(exc).__name__)
@@ -193,7 +245,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="A股主板异动与涨停盯盘", version="1.0.0", lifespan=lifespan)
 app.add_middleware(CORSMiddleware, allow_origins=list(settings.cors_origins),
-                   allow_methods=["GET", "PUT"], allow_headers=["Content-Type", "Authorization"])
+                   allow_methods=["GET", "PUT", "POST", "DELETE"], allow_headers=["Content-Type", "Authorization"])
 
 
 def authorize(authorization: str | None) -> None:
@@ -223,6 +275,67 @@ async def snapshot(request: Request, authorization: str | None = Header(default=
     authorize(authorization)
     # REST refresh/reconnect is state synchronization, never historical sound replay.
     return {**request.app.state.monitor.snapshot, "events": []}
+
+
+class WatchlistStock(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    code: str = Field(pattern=r"^(?:00|60)[0-9]{4}$")
+
+
+def watchlist_access(request: Request, authorization: str | None) -> Monitor:
+    authorize(authorization)
+    if request.headers.get("origin") and request.headers["origin"] not in settings.cors_origins:
+        raise HTTPException(status_code=403, detail="untrusted browser origin")
+    return request.app.state.monitor
+
+
+@app.get("/api/watchlist")
+async def get_watchlist(request: Request, authorization: str | None = Header(default=None)):
+    monitor = watchlist_access(request, authorization)
+    return monitor.engines.get(monitor.mode, monitor.engines["live"]).watchlist_rows()
+
+
+@app.get("/api/stocks/search")
+async def search_stocks(request: Request, q: str = "", authorization: str | None = Header(default=None)):
+    monitor = watchlist_access(request, authorization)
+    query = q.strip().casefold()
+    if not query or len(query) > 32:
+        return []
+    return [{"code": stock.code, "name": stock.name} for stock in monitor.eligible_stocks()
+            if query in stock.code or query in stock.name.casefold()][:30]
+
+
+@app.post("/api/watchlist")
+async def add_watchlist(body: WatchlistStock, request: Request, authorization: str | None = Header(default=None)):
+    monitor = watchlist_access(request, authorization)
+    engine = monitor.engines.get(monitor.mode, monitor.engines["live"])
+    if body.code not in engine.watchlist:
+        stocks = {q.code: q for q in monitor.eligible_stocks()}
+        if body.code not in stocks:
+            raise HTTPException(status_code=422, detail="股票不存在、非成熟主板股票或真实行情/交易日历尚不可用")
+        stock = stocks[body.code]
+        initial = {**asdict(stock), "listed": stock.listed.isoformat() if stock.listed else None,
+                   "quote_missing": True, "is_watchlist": True, "simulated": False}
+        if monitor.mode == "mock" and monitor.simulator and body.code in monitor.simulator.current:
+            quote = monitor.simulator.current[body.code]
+            initial.update(asdict(quote), listed=quote.listed.isoformat() if quote.listed else None,
+                           simulated=True)
+        try:
+            monitor.save_watchlist(engine.watchlist | {body.code}, initial)
+        except OSError as exc:
+            raise HTTPException(status_code=503, detail="自选股保存失败，请重试") from exc
+    return next(row for row in engine.watchlist_rows() if row["code"] == body.code)
+
+
+@app.delete("/api/watchlist/{code}")
+async def delete_watchlist(code: str, request: Request, authorization: str | None = Header(default=None)):
+    monitor = watchlist_access(request, authorization)
+    engine = monitor.engines.get(monitor.mode, monitor.engines["live"])
+    try:
+        monitor.save_watchlist(engine.watchlist - {code})
+    except OSError as exc:
+        raise HTTPException(status_code=503, detail="自选股保存失败，请重试") from exc
+    return {"code": code, "deleted": True}
 
 
 class Weights(BaseModel):

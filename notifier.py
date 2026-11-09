@@ -32,11 +32,11 @@ class Notifier:
         # Prune old cooldown keys, retaining a bounded daily dictionary.
         self.last_notify_time = {key: ts for key, ts in self.last_notify_time.items()
                                  if clock - ts < self.cfg.notify_cooldown}
-        for raw in events:
+        for raw in sorted(events, key=lambda event: not event.get("is_watchlist", False)):
             # Simulation never consumes the live-event cooldown budget.
             code = ("mock:" if raw["simulated"] else "live:") + raw["code"]
             key = (code, raw["event_type"])
-            if key in self.last_notify_time:
+            if key in self.last_notify_time and not raw.get("is_watchlist"):
                 self.suppressed += 1
                 log.info("冷却抑制 %s %s %s", raw["code"], raw["name"], EVENT_NAMES[raw["event_type"]])
                 continue
@@ -59,6 +59,8 @@ class Notifier:
     def markdown(event: dict) -> str:
         name = str(event["name"]).replace("<", "").replace(">", "").replace("\n", " ")
         mode = "模拟演练" if event["simulated"] else "实盘监控"
+        if event.get("is_watchlist"):
+            mode += " ★自选VIP"
         content = (f"### 【{mode}】{EVENT_NAMES[event['event_type']]}\n"
                    f"**{name} ({event['code']})**\n"
                    f"> 价格：{event['price']:.2f}　涨幅：{event['pct']:.2f}%\n"
