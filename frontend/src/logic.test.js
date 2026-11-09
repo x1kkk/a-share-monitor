@@ -1,6 +1,6 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { money, percent, eventGate, snapshotRows, rowAge, serialLatest } from './logic.js'
+import { money, percent, eventGate, snapshotRows, rowAge, serialLatest, alertQueue } from './logic.js'
 
 test('cash format preserves signs and missing data', () => {
   assert.equal(money(null), '—'); assert.equal(money(0), '0.00')
@@ -24,4 +24,26 @@ test('weight writes serialize and coalesce to the latest edit', async () => {
   const writer = serialLatest(async (value) => { calls.push(value.x); if (value.x === 1) await new Promise(resolve => { release = resolve }) })
   const first = writer({ x: 1 }); writer({ x: 2 }); writer({ x: 3 }); release(); await first
   assert.deepEqual(calls, [1, 3])
+})
+
+test('watchlist snapshots preserve radar order and all watched rows', () => {
+  const radar = [{ code: '600036' }, { code: '000001' }]
+  const rows = snapshotRows({ watchlist_anomalies: radar, watchlist_leaders: radar })
+  assert.deepEqual(rows.watchlist_anomalies, radar)
+  assert.notEqual(rows.watchlist_anomalies, radar)
+  assert.deepEqual(rows.watchlist_leaders, radar)
+  assert.deepEqual(snapshotRows({}).watchlist_leaders, [])
+})
+
+test('VIP notices survive normal bursts and still obey event-id deduplication', () => {
+  const gate = eventGate()
+  const vip = { id: 'vip', is_watchlist: true }
+  const normal = Array.from({ length: 10 }, (_, i) => ({ id: `normal-${i}` }))
+  const queue = alertQueue([], gate.accept([vip, ...normal]), 100)
+  assert.equal(queue.length, 6)
+  assert.equal(queue[0].id, 'vip')
+  assert.equal(queue[0].expires, 12100)
+  assert.equal(gate.accept([vip]).length, 0)
+  assert.equal(alertQueue(queue, [{ id: 'new-normal' }], 200)[0].id, 'vip')
+  assert.equal(alertQueue(queue, [], 12100).length, 0)
 })

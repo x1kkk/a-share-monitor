@@ -1,0 +1,36 @@
+.board-toolbar { gap: 12px; flex-wrap: wrap; }
+.tabs { flex-wrap: wrap; }
+.watch-search { padding: 20px; background: var(--surface); border: 1px solid var(--border); border-radius: 10px; margin-bottom: 20px; }
+.watch-search label { display: block; color: var(--yellow); margin-bottom: 10px; font-weight: 600; }
+.watch-search small { font-weight: 400; color: var(--muted); margin-left: 12px; }
+.watch-search-row { display: flex; gap: 12px; }
+.watch-search input { min-width: 0; flex: 1; background: #080c13; border: 1px solid #42516a; color: #e9eef7; border-radius: 6px; padding: 12px; }
+.watch-search p { font-size: 12px; color: #c3d3e8; margin-top: 10px; }
+.search-results { list-style: none; margin: 12px 0 0; padding: 0; max-height: 280px; overflow-y: auto; }
+.search-results button { width: 100%; display: flex; justify-content: space-between; padding: 12px; text-align: left; color: #e9eef7; background: #182334; border-bottom: 1px solid var(--border); }
+.search-results button span:last-child { color: var(--yellow); }
+.watch-boards { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 20px; }
+.watch-boards .board { min-width: 0; }
+.watch-boards h2 { font-size: 18px; }
+.watch-boards .watch-card { border-left: 3px solid #af8b42; }
+.watch-boards .expired { opacity: .48; filter: grayscale(.7); }
+.watch-timing { font-size: 12px; color: var(--muted); margin: 12px 0; }
+.watch-card .stock-metrics { margin-top: 16px; }
+.delete-stock { min-height: 44px; padding: 8px 16px; color: #ffb8c1; background: #442431; border: 1px solid #9c5263; border-radius: 6px; flex-shrink: 0; }
+.vip-banner { position: fixed; z-index: 60; top: 12px; left: 50%; transform: translateX(-50%); width: min(670px, calc(100vw - 24px)); border: 2px solid #edc979; border-radius: 9px; background: #3b2730; box-shadow: 0 8px 40px #0009; padding-right: 44px; }
+.vip-banner > button:first-child { width: 100%; background: transparent; color: #ffe1a0; text-align: left; padding: 16px; min-height: 52px; }
+.toast.vip-toast { border: 2px solid #edc979; border-left: 5px solid #ff697d; background: #352734; animation: vip-pulse .9s ease-in-out 4; }
+.vip-toast .toast-mark { background: #70542b; color: #ffe4a6; }
+.vip-toast .toast-type { color: #ffe4a6; }
+@keyframes vip-pulse { 50% { border-color: #ff697d; box-shadow: 0 0 20px #edc97966; } }
+@media (max-width: 900px) {
+  .watch-boards { grid-template-columns: 1fr; }
+  .watch-search small { display: block; margin-left: 0; margin-top: 6px; }
+  .tabs { width: 100%; gap: 2px; }
+  .tabs button { flex: 1 1 auto; white-space: nowrap; }
+  .watch-search { padding: 14px; }
+  .watch-search-row { flex-wrap: wrap; }
+  .watch-search-row input { flex-basis: 100%; }
+  .watch-search-row button { width: 100%; min-height: 44px; }
+}
+@media (prefers-reduced-motion: reduce) { .toast.vip-toast { animation: none; } }
