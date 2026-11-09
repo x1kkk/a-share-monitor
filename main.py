@@ -255,11 +255,11 @@ async def websocket(ws: WebSocket):
         await ws.close(code=1008)
         return
     # Browser clients authenticate in the first message, avoiding secrets in query URLs.
-    await ws.accept()
     queue = asyncio.Queue(maxsize=32)
     monitor = ws.app.state.monitor
     tasks: list[asyncio.Task] = []
     try:
+        await ws.accept()
         if settings.api_token:
             message = await asyncio.wait_for(ws.receive_json(), timeout=5)
             if not isinstance(message, dict):
