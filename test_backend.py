@@ -14,7 +14,7 @@ from fastapi.testclient import TestClient
 import main
 from config import SHANGHAI, Settings
 from engine import Engine, self_check
-from fetcher import demo_seed
+from fetcher import demo_seed, parse_quote
 from pre_market import MarketCalendar
 
 
@@ -22,8 +22,31 @@ class StateChecks(unittest.TestCase):
     def test_engine_boundaries(self):
         self_check()
 
+    def test_auction_parser_boundaries_and_invalid_prices(self):
+        row = {"f12": "600000", "f14": "竞价测试", "f2": 10.2, "f3": 2,
+               "f18": 10, "f21": 1e9,
+               **{key: "-" for key in ("f5", "f6", "f8", "f62", "f66", "f72")}}
+        for minute in (15, 24, 25, 29):
+            now = datetime(2026, 11, 4, 9, minute, tzinfo=SHANGHAI)
+            with self.subTest(minute=minute):
+                quote = parse_quote(row, now=now)
+                self.assertIsNotNone(quote)
+                self.assertEqual(quote.volume, 0)
+                for field in ("f2", "f18", "f3"):
+                    self.assertIsNone(parse_quote({**row, field: "-"}, now=now))
+        for minute in (14, 30):
+            self.assertIsNone(parse_quote(row, now=now.replace(minute=minute)))
+
 
 class LiveLoopChecks(unittest.IsolatedAsyncioTestCase):
+    async def test_ws_cancellation_during_accept(self):
+        monitor = main.Monitor(None, Settings())
+        socket = SimpleNamespace(headers={},
+                                 app=SimpleNamespace(state=SimpleNamespace(monitor=monitor)),
+                                 accept=AsyncMock(side_effect=asyncio.CancelledError))
+        await main.websocket(socket)
+        self.assertFalse(monitor.clients)
+
     async def test_auction_quiet_old_quote_is_not_filtered(self):
         cfg = replace(Settings(), mock_mode=False, wechat_webhook_url="", api_token="", poll_seconds=0.01)
         monitor = main.Monitor(None, cfg)
