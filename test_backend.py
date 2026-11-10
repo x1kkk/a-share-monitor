@@ -2,11 +2,14 @@
 from __future__ import annotations
 
 import asyncio
+import json
+import tempfile
 import unittest
 from contextlib import asynccontextmanager
 from dataclasses import replace
 from datetime import datetime, timedelta
 from types import SimpleNamespace
+from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
 from fastapi.testclient import TestClient
@@ -108,6 +111,29 @@ class LiveLoopChecks(unittest.IsolatedAsyncioTestCase):
 
 
 class WebSocketChecks(unittest.TestCase):
+    def test_tencent_observation_date_is_serializable_over_websocket(self):
+        cfg = replace(Settings(), wechat_webhook_url="", api_token="date-regression-token")
+        now = datetime.now(SHANGHAI)
+        quote = replace(demo_seed()[0], observed_since=now.date())
+        with tempfile.TemporaryDirectory() as directory:
+            monitor = main.Monitor(None, cfg, watchlist_path=Path(directory) / 'watchlist.json')
+            monitor.broadcast(monitor.engines['live'].update([quote], {}, now))
+            self.assertEqual(monitor.snapshot['leaders'][0]['observed_since'], now.date().isoformat())
+            json.dumps(monitor.snapshot)
+
+            @asynccontextmanager
+            async def lifespan(app):
+                app.state.monitor = monitor
+                yield
+
+            with patch.object(main, 'settings', cfg), patch.object(main.app.router, 'lifespan_context', lifespan):
+                with TestClient(main.app) as client:
+                    with client.websocket_connect('/ws', headers={'origin': 'http://localhost:5173'}) as ws:
+                        ws.send_json({'token': cfg.api_token})
+                        snapshot = ws.receive_json()
+                        self.assertEqual(snapshot['leaders'][0]['observed_since'], now.date().isoformat())
+                        self.assertEqual(snapshot['leaders'][0]['listed'], quote.listed.isoformat())
+
     def test_real_asgi_disconnect_and_authenticated_weights(self):
         cfg = replace(Settings(), wechat_webhook_url="", api_token="regression-token")
         monitor = main.Monitor(None, cfg)

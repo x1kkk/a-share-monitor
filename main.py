@@ -16,6 +16,7 @@ from pathlib import Path
 
 import httpx
 from fastapi import FastAPI, Header, HTTPException, Request, WebSocket, WebSocketDisconnect
+from fastapi.encoders import jsonable_encoder
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, ConfigDict, Field
@@ -109,7 +110,7 @@ class Monitor:
 
     def broadcast(self, snapshot: dict) -> None:
         self.sequence += 1
-        self.snapshot = {**snapshot, "sequence": self.sequence}
+        self.snapshot = jsonable_encoder({**snapshot, "sequence": self.sequence})
         for queue in tuple(self.clients):
             # Disconnect slow consumers rather than silently losing alert events.
             if queue.full():
@@ -122,7 +123,7 @@ class Monitor:
 
     async def initialize(self) -> None:
         today = datetime.now(SHANGHAI).date()
-        log.info("开始盘前初始化和真实静态快照抓取（最长 %.0f 秒）；默认 MOCK_MODE=%s",
+        log.info("开始盘前初始化和真实静态快照抓取（日历超时 %.0f 秒；首次股票池另含资料补全）；MOCK_MODE=%s",
                  self.cfg.calendar_timeout, self.cfg.mock_mode)
         results = await asyncio.gather(self.calendar.load(self.cfg, today),
                                        self.fetcher.fetch_market(bootstrap=True), return_exceptions=True)
@@ -172,7 +173,7 @@ class Monitor:
                         source = self.simulator.source
                     else:
                         raw = await self.fetcher.fetch_market()
-                        quotes = eligible(raw, self.calendar, now.date(), self.cfg)
+                        quotes = eligible(raw, self.calendar, now.date(), self.cfg, current_session=True)
                         # f124 is the stock's last change, not the package receipt
                         # time. Quiet/auction stocks must survive a successful fetch.
                         if not quotes:
@@ -181,7 +182,7 @@ class Monitor:
                             q.code for q in quotes if q.price >= limit_price(q.pre_close)
                             or q.high >= limit_price(q.pre_close)}
                         books = await self.fetcher.fetch_books(book_codes, datetime.now(SHANGHAI))
-                        source = "eastmoney+tencent"
+                        source = self.fetcher.source
                     now = datetime.now(SHANGHAI)
                     engine = self.engines[mode]
                     result = engine.update(quotes, books, now, simulated=mode == "mock",
@@ -190,6 +191,7 @@ class Monitor:
                     result["events"] = self.notifier.publish(result["events"])
                     elapsed = time.monotonic() - started
                     result.update({"status": "ok", "mode": mode, "source": source,
+                                   "using_cached_snapshot": False, "last_success_age_seconds": 0.0,
                                    "session": self.session, "cycle_ms": round(elapsed * 1000, 1),
                                    "calendar_error": self.calendar.error, "poll_seconds": self.cfg.poll_seconds})
                     self.last_success_clock = time.monotonic()
@@ -199,14 +201,19 @@ class Monitor:
                              sum(row["is_limit_up"] for row in result["leaders"]),
                              len(result["events"]), elapsed * 1000)
                 except (httpx.HTTPError, TimeoutError, ValueError) as exc:
-                    # Preserve the last good payload with a visible stale flag; no fake transitions.
-                    status = "blocked" if mode == "blocked" else "stale"
+                    # Retain the last snapshot during brief reconnects; never feed cached quotes into the engine.
+                    age = (time.monotonic() - self.last_success_clock
+                           if self.last_success_clock is not None else None)
+                    recovering = (mode == "live" and self.snapshot.get("mode") == "live"
+                                  and age is not None and age <= 60)
+                    status = "blocked" if mode == "blocked" else "recovering" if recovering else "stale"
                     aged = self.engines[mode].anomaly_board() if mode in self.engines else []
                     self.broadcast({**self.snapshot, "status": status, "mode": mode, "events": [],
                                     "anomalies": aged,
                                     "watchlist_anomalies": self.engines[mode].watchlist_board() if mode in self.engines else [],
                                     "error": str(exc) if isinstance(exc, ValueError) else type(exc).__name__,
-                                    "last_attempt": now.isoformat()})
+                                    "last_attempt": now.isoformat(), "using_cached_snapshot": True,
+                                    "last_success_age_seconds": round(age, 2) if age is not None else None})
                     log.warning("本轮不可用 mode=%s error=%s；未推进行情状态机", mode, type(exc).__name__)
                 next_tick += self.cfg.poll_seconds
                 current = asyncio.get_running_loop().time()
@@ -229,7 +236,7 @@ async def lifespan(app: FastAPI):
     async with httpx.AsyncClient(headers=HEADERS, proxy=settings.http_proxy, trust_env=False,
                                  timeout=settings.http_timeout,
                                  limits=httpx.Limits(max_connections=settings.max_concurrency,
-                                                    max_keepalive_connections=settings.max_concurrency)) as client:
+                                                    max_keepalive_connections=0)) as client:
         monitor = Monitor(client, settings)
         app.state.monitor = monitor
         tasks = [asyncio.create_task(monitor.poll()), asyncio.create_task(monitor.notifier.worker())]
