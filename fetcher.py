@@ -282,11 +282,18 @@ class Fetcher:
                              timeout: float | None = None) -> str:
         symbols = ",".join(("ff_" if flow else "") + ("sh" if c.startswith("60") else "sz") + c
                            for c in codes)
-        async with self.semaphore:
-            response = await self.client.get(self.cfg.tencent_url + symbols,
-                                             headers={"Referer": "https://gu.qq.com/"},
-                                             timeout=timeout or self.cfg.http_timeout)
-            response.raise_for_status()
+        for attempt in range(3):
+            try:
+                async with self.semaphore:
+                    response = await self.client.get(self.cfg.tencent_url + symbols,
+                                                     headers={"Referer": "https://gu.qq.com/"},
+                                                     timeout=timeout or self.cfg.http_timeout)
+                    response.raise_for_status()
+                break
+            except (httpx.RemoteProtocolError, httpx.NetworkError, httpx.TimeoutException):
+                if attempt == 2:
+                    raise
+                await asyncio.sleep(0.1 * 2 ** attempt)
         return response.content.decode("gb18030", errors="replace")
 
     async def _flows(self, batches: list[list[str]], today: date) -> dict[str, float]:
@@ -353,9 +360,18 @@ class Fetcher:
                 parsed.update(group)
                 books.update(group_books)
                 counters.update(group_counters)
-            quotes = [self._with_flow(q, counters[c], flows.get(c) if
-                      datetime.fromtimestamp(q.source_ts, SHANGHAI).date() == today else None)
-                      for c, q in parsed.items()]
+            quotes = []
+            for c, q in parsed.items():
+                old = self._flow_state.get(c)
+                if old and q.source_ts < old[0].source_ts:
+                    # Tencent nodes can briefly return an older per-stock snapshot.
+                    # Keep its original timestamp/counters; never roll back the whole market.
+                    quotes.append(old[0])
+                    counters[c] = old[1:]
+                    books.pop(c, None)
+                else:
+                    quotes.append(self._with_flow(q, counters[c], flows.get(c) if
+                                  datetime.fromtimestamp(q.source_ts, SHANGHAI).date() == today else None))
             if not quotes:
                 raise ValueError("no tradable main-board quotes")
             self._flow_state = {q.code: (q, *counters[q.code]) for q in quotes}
