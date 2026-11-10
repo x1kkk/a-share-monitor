@@ -16,6 +16,7 @@ from pathlib import Path
 
 import httpx
 from fastapi import FastAPI, Header, HTTPException, Request, WebSocket, WebSocketDisconnect
+from fastapi.encoders import jsonable_encoder
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, ConfigDict, Field
@@ -109,7 +110,7 @@ class Monitor:
 
     def broadcast(self, snapshot: dict) -> None:
         self.sequence += 1
-        self.snapshot = {**snapshot, "sequence": self.sequence}
+        self.snapshot = jsonable_encoder({**snapshot, "sequence": self.sequence})
         for queue in tuple(self.clients):
             # Disconnect slow consumers rather than silently losing alert events.
             if queue.full():
