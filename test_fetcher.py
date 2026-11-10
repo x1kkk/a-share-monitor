@@ -33,7 +33,7 @@ class FetcherChecks(unittest.IsolatedAsyncioTestCase):
 
         async with httpx.AsyncClient(transport=httpx.MockTransport(response)) as client:
             fetcher = Fetcher(client, self.settings())
-            self.assertEqual(len(await fetcher.fetch_market()), 3)
+            self.assertEqual(len(await fetcher._fetch_eastmoney()), 3)
             self.assertEqual(fetcher.last_total, 3)
         self.assertEqual(len(requests), 1)
         self.assertEqual(requests[0].url.params["pz"], "3500")
@@ -49,9 +49,9 @@ class FetcherChecks(unittest.IsolatedAsyncioTestCase):
 
         async with httpx.AsyncClient(transport=httpx.MockTransport(response)) as client:
             fetcher = Fetcher(client, self.settings())
-            self.assertEqual(len(await fetcher.fetch_market()), 3)
+            self.assertEqual(len(await fetcher._fetch_eastmoney()), 3)
             self.assertFalse(fetcher._large_page_supported)
-            self.assertEqual(len(await fetcher.fetch_market()), 3)
+            self.assertEqual(len(await fetcher._fetch_eastmoney()), 3)
         self.assertEqual(requests, [("1", "3500"), ("2", "2"), ("1", "2"), ("2", "2")])
 
     async def test_failed_large_page_falls_back(self):
@@ -65,7 +65,7 @@ class FetcherChecks(unittest.IsolatedAsyncioTestCase):
             return httpx.Response(200, json={"data": {"total": 3, "diff": batch}})
 
         async with httpx.AsyncClient(transport=httpx.MockTransport(response)) as client:
-            self.assertEqual(len(await Fetcher(client, self.settings()).fetch_market()), 3)
+            self.assertEqual(len(await Fetcher(client, self.settings())._fetch_eastmoney()), 3)
         self.assertEqual(requests, ["3500", "2", "2"])
 
     async def test_transport_errors_retry_with_bounded_backoff(self):
@@ -101,7 +101,7 @@ class FetcherChecks(unittest.IsolatedAsyncioTestCase):
             fetcher.last_raw, fetcher.last_total = old, 3
             with patch("fetcher.asyncio.sleep", new_callable=AsyncMock):
                 with self.assertRaises(httpx.RemoteProtocolError):
-                    await fetcher.fetch_market()
+                    await fetcher._fetch_eastmoney()
             self.assertIs(fetcher.last_raw, old)
             self.assertEqual(fetcher.last_total, 3)
         self.assertEqual(second_page_attempts, 4)
@@ -119,7 +119,7 @@ class FetcherChecks(unittest.IsolatedAsyncioTestCase):
                     old = demo_seed()
                     fetcher.last_raw = old
                     with self.assertRaises(ValueError):
-                        await fetcher.fetch_market()
+                        await fetcher._fetch_eastmoney()
                     self.assertIs(fetcher.last_raw, old)
 
     async def test_deadline_cancels_pending_pages(self):
@@ -138,7 +138,7 @@ class FetcherChecks(unittest.IsolatedAsyncioTestCase):
         async with httpx.AsyncClient(transport=httpx.MockTransport(response)) as client:
             fetcher = Fetcher(client, self.settings(eastmoney_deadline=0.03))
             with self.assertRaises(TimeoutError):
-                await fetcher.fetch_market()
+                await fetcher._fetch_eastmoney()
             self.assertEqual(active, 0)
             self.assertEqual(fetcher.last_raw, [])
 
