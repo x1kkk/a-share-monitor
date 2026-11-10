@@ -50,7 +50,9 @@ class FetcherChecks(unittest.IsolatedAsyncioTestCase):
         async with httpx.AsyncClient(transport=httpx.MockTransport(response)) as client:
             fetcher = Fetcher(client, self.settings())
             self.assertEqual(len(await fetcher.fetch_market()), 3)
-        self.assertEqual(requests, [("1", "3500"), ("2", "2")])
+            self.assertFalse(fetcher._large_page_supported)
+            self.assertEqual(len(await fetcher.fetch_market()), 3)
+        self.assertEqual(requests, [("1", "3500"), ("2", "2"), ("1", "2"), ("2", "2")])
 
     async def test_failed_large_page_falls_back(self):
         requests = []

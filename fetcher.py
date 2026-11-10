@@ -117,6 +117,7 @@ class Fetcher:
         self.semaphore = asyncio.Semaphore(cfg.max_concurrency)
         self.last_raw: list[Quote] = []
         self.last_total: int | None = None
+        self._large_page_supported = True
 
     async def _page(self, page: int, request_timeout: float | None = None,
                     *, page_size: int | None = None) -> tuple[int, list[dict]]:
@@ -163,12 +164,16 @@ class Fetcher:
         request_timeout = self.cfg.bootstrap_http_timeout if bootstrap else self.cfg.http_timeout
         async with asyncio.timeout(deadline):
             total, first = None, []
-            try:
-                # Reserve time for fallback; retries must not consume the whole cycle.
-                async with asyncio.timeout(min(request_timeout, deadline / 3)):
-                    total, first = await self._page(1, request_timeout, page_size=3500)
-            except (httpx.HTTPError, TimeoutError, ValueError):
-                log.debug("Eastmoney large page unavailable; falling back to pagination")
+            if self._large_page_supported:
+                try:
+                    # Reserve time for fallback; retries must not consume the whole cycle.
+                    async with asyncio.timeout(min(request_timeout, deadline / 3)):
+                        total, first = await self._page(1, request_timeout, page_size=3500)
+                    if total > len(first) == self.cfg.page_size:
+                        # Cache an observed server cap. Later rounds can start all pages together.
+                        self._large_page_supported = False
+                except (httpx.HTTPError, TimeoutError, ValueError):
+                    log.debug("Eastmoney large page unavailable; falling back to pagination")
             codes = [str(row.get("f12", "")) for row in first]
             if total and len(first) == total and len(set(codes)) == total:
                 pages = [(total, first)]
