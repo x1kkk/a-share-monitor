@@ -229,7 +229,7 @@ async def lifespan(app: FastAPI):
     async with httpx.AsyncClient(headers=HEADERS, proxy=settings.http_proxy, trust_env=False,
                                  timeout=settings.http_timeout,
                                  limits=httpx.Limits(max_connections=settings.max_concurrency,
-                                                    max_keepalive_connections=settings.max_concurrency)) as client:
+                                                    max_keepalive_connections=0)) as client:
         monitor = Monitor(client, settings)
         app.state.monitor = monitor
         tasks = [asyncio.create_task(monitor.poll()), asyncio.create_task(monitor.notifier.worker())]

@@ -25,12 +25,12 @@ class Settings:
     mock_wechat: bool = field(default_factory=lambda: env_bool("MOCK_WECHAT", False))
     api_token: str = field(default_factory=lambda: os.getenv("API_TOKEN", ""))
     poll_seconds: float = 2.0
-    http_timeout: float = 1.6
-    eastmoney_deadline: float = 1.85
-    book_deadline: float = 0.4
+    http_timeout: float = 3.0
+    eastmoney_deadline: float = 5.0
+    book_deadline: float = 1.5
     page_size: int = 100
     max_pages: int = 80
-    max_concurrency: int = 24
+    max_concurrency: int = 12
     bootstrap_deadline: float = 10.0
     bootstrap_http_timeout: float = 3.0
     calendar_timeout: float = 18.0
