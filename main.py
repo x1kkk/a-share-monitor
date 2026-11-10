@@ -204,7 +204,7 @@ class Monitor:
                     age = (time.monotonic() - self.last_success_clock
                            if self.last_success_clock is not None else None)
                     recovering = (mode == "live" and self.snapshot.get("mode") == "live"
-                                  and age is not None and age <= 10)
+                                  and age is not None and age <= 60)
                     status = "blocked" if mode == "blocked" else "recovering" if recovering else "stale"
                     aged = self.engines[mode].anomaly_board() if mode in self.engines else []
                     self.broadcast({**self.snapshot, "status": status, "mode": mode, "events": [],

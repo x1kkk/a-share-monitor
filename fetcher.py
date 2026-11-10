@@ -191,9 +191,13 @@ class Fetcher:
                 page_count = math.ceil(total / self.cfg.page_size)
                 if page_count > self.cfg.max_pages:
                     raise ValueError("unexpected market size")
+                # Leave time for another connection/proxy instead of spending the deadline
+                # on the first wave of a stalled tunnel. http_timeout remains the upper bound.
+                page_timeout = min(request_timeout,
+                                   deadline / (math.ceil(page_count / self.cfg.max_concurrency) + 1))
                 # Each failed page retries independently; never publish partial rows.
                 pages += await asyncio.gather(
-                    *(self._page(p, request_timeout) for p in range(start_page, page_count + 1)),
+                    *(self._page(p, page_timeout) for p in range(start_page, page_count + 1)),
                     return_exceptions=True)
             rows = []
             for page in pages:

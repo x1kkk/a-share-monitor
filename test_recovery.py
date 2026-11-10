@@ -57,8 +57,11 @@ class RecoveryLoopChecks(unittest.IsolatedAsyncioTestCase):
     async def test_short_outage_keeps_cached_display_in_recovery(self):
         await self.check_recovery(1, 'recovering')
 
+    async def test_rotation_outage_remains_explicitly_cached(self):
+        await self.check_recovery(30, 'recovering')
+
     async def test_long_outage_exposes_stale_data(self):
-        await self.check_recovery(15, 'stale')
+        await self.check_recovery(65, 'stale')
 
     async def test_without_success_there_is_no_recovery_grace(self):
         await self.check_recovery(None, 'stale')
