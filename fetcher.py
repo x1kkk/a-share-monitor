@@ -128,13 +128,20 @@ class Fetcher:
         for attempt in range(4):
             try:
                 async with self.semaphore:
-                    response = await self.client.get(
-                        self.cfg.eastmoney_url, params=params,
-                        timeout=request_timeout or self.cfg.http_timeout,
-                        headers={"Connection": "close"})
+                    options = {"params": params,
+                               "timeout": request_timeout or self.cfg.http_timeout,
+                               "headers": {"Connection": "close"}}
+                    if attempt % 2 and self.cfg.http_proxy_backup:
+                        # A separate short-lived pool avoids closing other in-flight pages.
+                        async with httpx.AsyncClient(
+                                proxy=self.cfg.http_proxy_backup, headers=self.client.headers,
+                                trust_env=False, limits=httpx.Limits(max_keepalive_connections=0)) as backup:
+                            response = await backup.get(self.cfg.eastmoney_url, **options)
+                    else:
+                        response = await self.client.get(self.cfg.eastmoney_url, **options)
                     response.raise_for_status()
                 break
-            except (httpx.RemoteProtocolError, httpx.ConnectError, httpx.TimeoutException):
+            except (httpx.RemoteProtocolError, httpx.NetworkError, httpx.ProxyError, httpx.TimeoutException):
                 if attempt == 3:
                     raise
                 await asyncio.sleep(min(0.1 * 2 ** attempt, 0.3))

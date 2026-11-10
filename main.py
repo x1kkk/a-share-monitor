@@ -190,6 +190,7 @@ class Monitor:
                     result["events"] = self.notifier.publish(result["events"])
                     elapsed = time.monotonic() - started
                     result.update({"status": "ok", "mode": mode, "source": source,
+                                   "using_cached_snapshot": False, "last_success_age_seconds": 0.0,
                                    "session": self.session, "cycle_ms": round(elapsed * 1000, 1),
                                    "calendar_error": self.calendar.error, "poll_seconds": self.cfg.poll_seconds})
                     self.last_success_clock = time.monotonic()
@@ -199,14 +200,19 @@ class Monitor:
                              sum(row["is_limit_up"] for row in result["leaders"]),
                              len(result["events"]), elapsed * 1000)
                 except (httpx.HTTPError, TimeoutError, ValueError) as exc:
-                    # Preserve the last good payload with a visible stale flag; no fake transitions.
-                    status = "blocked" if mode == "blocked" else "stale"
+                    # Retain the last snapshot during brief reconnects; never feed cached quotes into the engine.
+                    age = (time.monotonic() - self.last_success_clock
+                           if self.last_success_clock is not None else None)
+                    recovering = (mode == "live" and self.snapshot.get("mode") == "live"
+                                  and age is not None and age <= 10)
+                    status = "blocked" if mode == "blocked" else "recovering" if recovering else "stale"
                     aged = self.engines[mode].anomaly_board() if mode in self.engines else []
                     self.broadcast({**self.snapshot, "status": status, "mode": mode, "events": [],
                                     "anomalies": aged,
                                     "watchlist_anomalies": self.engines[mode].watchlist_board() if mode in self.engines else [],
                                     "error": str(exc) if isinstance(exc, ValueError) else type(exc).__name__,
-                                    "last_attempt": now.isoformat()})
+                                    "last_attempt": now.isoformat(), "using_cached_snapshot": True,
+                                    "last_success_age_seconds": round(age, 2) if age is not None else None})
                     log.warning("本轮不可用 mode=%s error=%s；未推进行情状态机", mode, type(exc).__name__)
                 next_tick += self.cfg.poll_seconds
                 current = asyncio.get_running_loop().time()

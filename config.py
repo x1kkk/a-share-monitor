@@ -20,6 +20,7 @@ def env_bool(name: str, default: bool) -> bool:
 class Settings:
     mock_mode: bool = field(default_factory=lambda: env_bool("MOCK_MODE", MOCK_MODE))
     http_proxy: str | None = field(default_factory=lambda: os.getenv("HTTP_PROXY") or HTTP_PROXY)
+    http_proxy_backup: str | None = field(default_factory=lambda: os.getenv("HTTP_PROXY_BACKUP") or None)
     wechat_webhook_url: str = field(default_factory=lambda: os.getenv("WECHAT_WEBHOOK_URL", WECHAT_WEBHOOK_URL))
     # Off-hours simulation must never send pretend stock signals to a real group by default.
     mock_wechat: bool = field(default_factory=lambda: env_bool("MOCK_WECHAT", False))

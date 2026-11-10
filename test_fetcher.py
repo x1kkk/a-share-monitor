@@ -140,6 +140,22 @@ class FetcherChecks(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(active, 0)
             self.assertEqual(fetcher.last_raw, [])
 
+    async def test_protocol_error_retries_on_backup_tunnel(self):
+        def disconnected(request):
+            raise httpx.RemoteProtocolError("injected tunnel rotation", request=request)
+
+        def response(request):
+            return httpx.Response(200, json={"data": {"total": 1, "diff": ROWS[:1]}})
+
+        async with httpx.AsyncClient(transport=httpx.MockTransport(disconnected)) as primary:
+            backup = httpx.AsyncClient(transport=httpx.MockTransport(response))
+            cfg = self.settings(http_proxy_backup="http://backup.invalid:15818")
+            with patch("fetcher.httpx.AsyncClient", return_value=backup) as constructor:
+                self.assertEqual((await Fetcher(primary, cfg)._page(1))[0], 1)
+                self.assertEqual(constructor.call_args.kwargs["proxy"], cfg.http_proxy_backup)
+            self.assertTrue(backup.is_closed)
+            self.assertFalse(primary.is_closed)
+
     async def test_real_socket_disconnect_recovers_on_new_connection(self):
         headers, connections = [], 0
 
