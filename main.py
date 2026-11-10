@@ -122,7 +122,7 @@ class Monitor:
 
     async def initialize(self) -> None:
         today = datetime.now(SHANGHAI).date()
-        log.info("开始盘前初始化和真实静态快照抓取（最长 %.0f 秒）；默认 MOCK_MODE=%s",
+        log.info("开始盘前初始化和真实静态快照抓取（日历超时 %.0f 秒；首次股票池另含资料补全）；MOCK_MODE=%s",
                  self.cfg.calendar_timeout, self.cfg.mock_mode)
         results = await asyncio.gather(self.calendar.load(self.cfg, today),
                                        self.fetcher.fetch_market(bootstrap=True), return_exceptions=True)
@@ -172,7 +172,7 @@ class Monitor:
                         source = self.simulator.source
                     else:
                         raw = await self.fetcher.fetch_market()
-                        quotes = eligible(raw, self.calendar, now.date(), self.cfg)
+                        quotes = eligible(raw, self.calendar, now.date(), self.cfg, current_session=True)
                         # f124 is the stock's last change, not the package receipt
                         # time. Quiet/auction stocks must survive a successful fetch.
                         if not quotes:
@@ -181,7 +181,7 @@ class Monitor:
                             q.code for q in quotes if q.price >= limit_price(q.pre_close)
                             or q.high >= limit_price(q.pre_close)}
                         books = await self.fetcher.fetch_books(book_codes, datetime.now(SHANGHAI))
-                        source = "eastmoney+tencent"
+                        source = self.fetcher.source
                     now = datetime.now(SHANGHAI)
                     engine = self.engines[mode]
                     result = engine.update(quotes, books, now, simulated=mode == "mock",
