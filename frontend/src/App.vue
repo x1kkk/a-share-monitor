@@ -11,10 +11,10 @@ try { savedToken = sessionStorage.getItem('monitor-token') || '' } catch { /* Br
 const token = ref(savedToken), sound = ref(false), soundError = ref(''), toasts = ref([])
 const gate = eventGate(), eventNames = { anomaly: '新异动入榜', limit_up: '首次封板', break_open: '炸板告警' }
 let socket, reconnectTimer, clockTimer, watchdogTimer, debounceTimer, stopped = false, retry = 0, audio, nextTone = 0, firstSnapshot = true, lastMessage = Date.now(), acknowledgedWeights = null
-const stale = computed(() => connection.value !== 'connected' || data.value.status !== 'ok')
+const stale = computed(() => connection.value !== 'connected' || !['ok', 'recovering'].includes(data.value.status))
 const modeLabel = computed(() => data.value.mode === 'mock' || data.value.simulated ? '模拟演练 MOCK' : data.value.session === 'closed' ? '盘后休市' : data.value.mode === 'live' ? '实盘监控 LIVE' : '等待监控数据')
 const modeClass = computed(() => data.value.mode === 'mock' || data.value.simulated ? 'mock' : data.value.session === 'closed' ? 'closed' : data.value.mode === 'live' ? 'live' : 'closed')
-const connectionLabel = computed(() => ({ connecting: '连接中', connected: data.value.status === 'ok' ? '实时连接' : '行情暂不可用', disconnected: '连接断开 · 保留最后快照', auth: '连接被拒绝 · 检查令牌或域名' })[connection.value])
+const connectionLabel = computed(() => ({ connecting: '连接中', connected: data.value.status === 'ok' ? '实时连接' : data.value.status === 'recovering' ? '行情重连中 · 保留上轮快照' : '行情暂不可用', disconnected: '连接断开 · 保留最后快照', auth: '连接被拒绝 · 检查令牌或域名' })[connection.value])
 const elapsed = computed(() => Math.max(0, (wallClock.value - receivedAt.value) / 1000))
 const counts = computed(() => ({ active: data.value.anomalies.filter(row => row.status === 'active').length, sealed: data.value.leaders.filter(row => row.is_limit_up).length }))
 const weightTotal = computed(() => Object.values(draft).reduce((sum, value) => sum + Number(value), 0))
@@ -177,7 +177,7 @@ onBeforeUnmount(() => {
         <div class="header-actions"><span v-if="data.session === 'closed' && modeClass === 'mock'" class="session-badge">盘后休市</span><span class="mode-badge" :class="modeClass"><i/>{{ modeLabel }}</span><button class="icon-button" @click="authOpen = !authOpen" :aria-expanded="authOpen" aria-controls="connection-settings" aria-label="展开连接设置"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M9 3h6l1 3 3 1 2 5-2 5-3 1-1 3H9l-1-3-3-1-2-5 2-5 3-1z"/><circle cx="12" cy="12" r="3"/></svg></button></div>
       </div>
       <div class="console-bottom">
-        <div class="telemetry"><div class="clock"><span class="eyebrow">北京时间</span><strong>{{ localTime(wallClock) }}</strong></div><div><span class="metric-caption">监控主板股票</span><strong>{{ Number(data.stock_count || 0).toLocaleString('zh-CN') }}<small>只</small></strong></div><div><span class="metric-caption">单轮刷新耗时</span><strong>{{ numeric(data.cycle_ms) ? Math.round(data.cycle_ms) : '—' }}<small>ms</small></strong></div><div class="connection-summary"><span class="connection-label" :class="{ 'is-stale': stale }"><i/>{{ connectionLabel }}</span><span class="metric-caption">快照 {{ localTime(data.time) }}</span></div></div>
+        <div class="telemetry"><div class="clock"><span class="eyebrow">北京时间</span><strong>{{ localTime(wallClock) }}</strong></div><div><span class="metric-caption">监控主板股票</span><strong>{{ Number(data.stock_count || 0).toLocaleString('zh-CN') }}<small>只</small></strong></div><div><span class="metric-caption">单轮刷新耗时</span><strong>{{ numeric(data.cycle_ms) ? Math.round(data.cycle_ms) : '—' }}<small>ms</small></strong></div><div class="connection-summary"><span class="connection-label" :class="{ 'is-stale': stale || data.status === 'recovering' }"><i/>{{ connectionLabel }}</span><span class="metric-caption">快照 {{ localTime(data.time) }}</span></div></div>
         <div class="console-buttons"><button class="sound-button" :class="{ enabled: sound }" @click="enableSound"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m11 5-6 4H2v6h3l6 4zM15 8a6 6 0 0 1 0 8m3-11a10 10 0 0 1 0 14"/></svg>{{ sound ? '声音提醒已开启' : '点击开启盯盘声音' }}</button><button class="secondary-button" @click="weightsOpen = !weightsOpen" :aria-expanded="weightsOpen" aria-controls="weights-panel">强度分权重 <span>{{ weightsOpen ? '−' : '+' }}</span></button></div>
       </div>
       <p v-if="soundError" class="error-message" role="alert">{{ soundError }}</p>

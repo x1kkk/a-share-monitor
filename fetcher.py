@@ -117,16 +117,35 @@ class Fetcher:
         self.semaphore = asyncio.Semaphore(cfg.max_concurrency)
         self.last_raw: list[Quote] = []
         self.last_total: int | None = None
+        self._large_page_supported = True
 
-    async def _page(self, page: int, request_timeout: float | None = None) -> tuple[int, list[dict]]:
-        params = {"pn": page, "pz": self.cfg.page_size, "po": 0, "np": 1,
+    async def _page(self, page: int, request_timeout: float | None = None,
+                    *, page_size: int | None = None) -> tuple[int, list[dict]]:
+        params = {"pn": page, "pz": page_size or self.cfg.page_size, "po": 0, "np": 1,
                   "ut": "bd1d9ddb04089700cf9c27f6f7426281",
                   "fltt": 2, "invt": 2, "fid": "f12", "fs": self.cfg.market_filter,
                   "fields": self.cfg.fields}
-        async with self.semaphore:
-            response = await self.client.get(self.cfg.eastmoney_url, params=params,
-                                             timeout=request_timeout or self.cfg.http_timeout)
-            response.raise_for_status()
+        # Three retries, each using a fresh connection (lifespan disables keep-alive).
+        for attempt in range(4):
+            try:
+                async with self.semaphore:
+                    options = {"params": params,
+                               "timeout": request_timeout or self.cfg.http_timeout,
+                               "headers": {"Connection": "close"}}
+                    if attempt % 2 and self.cfg.http_proxy_backup:
+                        # A separate short-lived pool avoids closing other in-flight pages.
+                        async with httpx.AsyncClient(
+                                proxy=self.cfg.http_proxy_backup, headers=self.client.headers,
+                                trust_env=False, limits=httpx.Limits(max_keepalive_connections=0)) as backup:
+                            response = await backup.get(self.cfg.eastmoney_url, **options)
+                    else:
+                        response = await self.client.get(self.cfg.eastmoney_url, **options)
+                    response.raise_for_status()
+                break
+            except (httpx.RemoteProtocolError, httpx.NetworkError, httpx.ProxyError, httpx.TimeoutException):
+                if attempt == 3:
+                    raise
+                await asyncio.sleep(min(0.1 * 2 ** attempt, 0.3))
         payload = response.json()
         data = payload.get("data") if isinstance(payload, dict) else None
         if not isinstance(data, dict) or not isinstance(data.get("diff"), list):
@@ -144,19 +163,42 @@ class Fetcher:
         deadline = self.cfg.bootstrap_deadline if bootstrap else self.cfg.eastmoney_deadline
         request_timeout = self.cfg.bootstrap_http_timeout if bootstrap else self.cfg.http_timeout
         async with asyncio.timeout(deadline):
-            if self.last_total is None:
-                total, first = await self._page(1, request_timeout)
+            total, first = None, []
+            if self._large_page_supported:
+                try:
+                    # Reserve time for fallback; retries must not consume the whole cycle.
+                    async with asyncio.timeout(min(request_timeout, deadline / 3)):
+                        total, first = await self._page(1, request_timeout, page_size=3500)
+                    if total > len(first) == self.cfg.page_size:
+                        # Cache an observed server cap. Later rounds can start all pages together.
+                        self._large_page_supported = False
+                except (httpx.HTTPError, TimeoutError, ValueError):
+                    log.debug("Eastmoney large page unavailable; falling back to pagination")
+            codes = [str(row.get("f12", "")) for row in first]
+            if total and len(first) == total and len(set(codes)) == total:
                 pages = [(total, first)]
-                start_page = 2
             else:
-                total, pages, start_page = self.last_total, [], 1
-            if total <= 0:
-                raise ValueError("empty market snapshot")
-            page_count = math.ceil(total / self.cfg.page_size)
-            if page_count > self.cfg.max_pages:
-                raise ValueError("unexpected market size")
-            pages += await asyncio.gather(*(self._page(p, request_timeout) for p in range(start_page, page_count + 1)),
-                                          return_exceptions=True)
+                # Eastmoney may silently cap pz=3500 at 100. Reuse that first page.
+                if total and len(first) == self.cfg.page_size:
+                    pages, start_page = [(total, first)], 2
+                elif self.last_total is not None:
+                    total, pages, start_page = self.last_total, [], 1
+                else:
+                    total, first = await self._page(1, request_timeout)
+                    pages, start_page = [(total, first)], 2
+                if total <= 0:
+                    raise ValueError("empty market snapshot")
+                page_count = math.ceil(total / self.cfg.page_size)
+                if page_count > self.cfg.max_pages:
+                    raise ValueError("unexpected market size")
+                # Leave time for another connection/proxy instead of spending the deadline
+                # on the first wave of a stalled tunnel. http_timeout remains the upper bound.
+                page_timeout = min(request_timeout,
+                                   deadline / (math.ceil(page_count / self.cfg.max_concurrency) + 1))
+                # Each failed page retries independently; never publish partial rows.
+                pages += await asyncio.gather(
+                    *(self._page(p, page_timeout) for p in range(start_page, page_count + 1)),
+                    return_exceptions=True)
             rows = []
             for page in pages:
                 if isinstance(page, BaseException):
