@@ -102,12 +102,12 @@ async def audit() -> None:
 
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
         fetcher = Fetcher(client, cfg)
-        quotes = await fetcher.fetch_market(bootstrap=True)
+        quotes = await fetcher._fetch_eastmoney(bootstrap=True)
         assert len(quotes) == 3100 and set(calls) == set(range(1, 32))
         result["pagination_fixture"] = {"count": len(quotes), "pages": len(calls), "status": "PASS"}
         for mode in ("duplicate", "partial"):
             try:
-                await fetcher.fetch_market(bootstrap=True)
+                await fetcher._fetch_eastmoney(bootstrap=True)
             except ValueError as exc:
                 result["pagination_fixture"][mode] = str(exc)
             else:

@@ -17,3 +17,9 @@ backend_ws_capture.json
 
 watchlist.json
 .watchlist-*.tmp
+universe_cache.json
+sector_cache.json
+market_snapshot.json
+market_calendar_cache.json
+.market-*.tmp
+company_sectors.json

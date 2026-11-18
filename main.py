@@ -10,19 +10,21 @@ import re
 import tempfile
 import time
 from contextlib import asynccontextmanager
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from datetime import datetime
 from pathlib import Path
 
 import httpx
 from fastapi import FastAPI, Header, HTTPException, Request, WebSocket, WebSocketDisconnect
+from fastapi.encoders import jsonable_encoder
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, ConfigDict, Field
 
 from config import HEADERS, SHANGHAI, Settings, settings
 from engine import Engine
-from fetcher import Fetcher, Simulator, demo_seed, eligible, limit_price
+from fetcher import Fetcher, eligible, limit_price
+from closing import SnapshotStore, close_target
 from notifier import Notifier
 from pre_market import MarketCalendar
 
@@ -38,18 +40,20 @@ class Monitor:
         self.cfg = cfg
         self.fetcher = Fetcher(client, cfg)
         self.calendar = MarketCalendar()
-        # Separate engines keep off-hours simulation out of the real intraday state.
+        # The mock engine remains only for legacy offline checks; production never selects it.
         self.engines = {"mock": Engine(cfg), "live": Engine(cfg)}
         self.notifier = Notifier(client, cfg)
         self.clients: set[asyncio.Queue] = set()
-        self.simulator: Simulator | None = None
-        self.simulator_day = None
         self.mode = "initializing"
         self.session = None
         self.last_success_clock: float | None = None
         self.snapshot = {"type": "snapshot", "status": "initializing", "events": [],
                          "anomalies": [], "leaders": [], "stock_count": 0}
         self.watchlist_path = watchlist_path or Path(__file__).resolve().parent / "watchlist.json"
+        self.snapshot_store = SnapshotStore(self.watchlist_path.parent / 'market_snapshot.json')
+        self.saved_snapshot = self.snapshot_store.load()
+        self.snapshot_save_at = 0.0
+        self.close_retry_at = 0.0
         try:
             codes = json.loads(self.watchlist_path.read_text(encoding="utf-8"))
             if not isinstance(codes, list) or any(not isinstance(c, str) or not re.fullmatch(r"(?:00|60)[0-9]{4}", c) for c in codes):
@@ -58,7 +62,7 @@ class Monitor:
             codes = []
         for engine in self.engines.values():
             engine.watchlist = set(codes)
-        self.snapshot.update(watchlist_anomalies=[], watchlist_leaders=self.engines["mock"].watchlist_rows())
+        self.snapshot.update(watchlist_anomalies=[], watchlist_leaders=self.engines["live"].watchlist_rows())
         self.sequence = 0
         self.calendar_task: asyncio.Task | None = None
         self.calendar_retry_at = 0.0
@@ -109,7 +113,7 @@ class Monitor:
 
     def broadcast(self, snapshot: dict) -> None:
         self.sequence += 1
-        self.snapshot = {**snapshot, "sequence": self.sequence}
+        self.snapshot = jsonable_encoder({**snapshot, "sequence": self.sequence})
         for queue in tuple(self.clients):
             # Disconnect slow consumers rather than silently losing alert events.
             if queue.full():
@@ -122,7 +126,7 @@ class Monitor:
 
     async def initialize(self) -> None:
         today = datetime.now(SHANGHAI).date()
-        log.info("开始盘前初始化和真实静态快照抓取（最长 %.0f 秒）；默认 MOCK_MODE=%s",
+        log.info("开始盘前初始化和真实静态快照抓取（日历超时 %.0f 秒；首次股票池另含资料补全）；MOCK_MODE=%s",
                  self.cfg.calendar_timeout, self.cfg.mock_mode)
         results = await asyncio.gather(self.calendar.load(self.cfg, today),
                                        self.fetcher.fetch_market(bootstrap=True), return_exceptions=True)
@@ -131,17 +135,79 @@ class Monitor:
             try:
                 await self.fetcher.fetch_market(bootstrap=True)
             except (httpx.HTTPError, TimeoutError, ValueError) as exc:
-                log.warning("真实行情不可用：%s；模拟模式可使用明确标记的本地虚构快照", type(exc).__name__)
+                log.warning("真实行情不可用：%s；仅保留已验证历史快照，不生成模拟数据", type(exc).__name__)
         self.calendar_retry_at = time.monotonic() + 300
 
-    def make_simulator(self, now: datetime) -> None:
-        seeds = eligible(self.fetcher.last_raw, self.calendar, now.date(), self.cfg)
-        source = "real_static_snapshot"
-        if not seeds:
-            seeds, source = demo_seed(), "synthetic_demo_snapshot"
-        self.simulator = Simulator(seeds, self.cfg, source)
-        self.simulator_day = now.date()
-        log.warning("进入模拟：种子来源=%s 数量=%d；模拟微信=%s", source, len(seeds), self.cfg.mock_wechat)
+    def persist_snapshot(self, result):
+        clean = jsonable_encoder(result)
+        self.saved_snapshot = {**clean, 'events': []}
+        if time.monotonic() >= self.snapshot_save_at or clean.get('snapshot_kind') == 'close':
+            try:
+                self.saved_snapshot = self.snapshot_store.save(clean)
+                self.snapshot_save_at = time.monotonic() + 60
+            except OSError:
+                log.exception('真实快照保存失败；保留内存结果，不影响轮询')
+
+    def decorate_snapshot(self, snapshot):
+        result = {**snapshot}
+        for key in ('leaders', 'anomalies', 'watchlist_leaders', 'watchlist_anomalies'):
+            result[key] = []
+            for row in snapshot.get(key, []):
+                fields = self.fetcher.sectors.lookup(row.get('code', ''))
+                # A metadata source outage must not erase existing labels.
+                meta = fields if row.get('code') in self.fetcher.sectors.index else {}
+                item = {**row, **meta}
+                item['concepts'] = [tag for tag in item.get('raw_tags', '').split(',') if tag]
+                result[key].append(item)
+        return result
+
+    async def show_closed(self, now):
+        target = close_target(now, self.calendar)
+        complete = bool(target and self.saved_snapshot
+                        and self.saved_snapshot.get('as_of') == target.isoformat()
+                        and self.saved_snapshot.get('snapshot_kind') == 'close')
+        if target and not complete and time.monotonic() >= self.close_retry_at:
+            self.close_retry_at = time.monotonic() + 60
+            try:
+                raw = await self.fetcher.fetch_market()
+                newest = max(q.source_ts or 0 for q in raw)
+                if newest < target.timestamp() or newest >= target.timestamp() + 3600:
+                    raise ValueError('provider snapshot does not match the expected session close')
+                calendar = replace(self.calendar, loaded_for=target.date())
+                quotes = eligible(raw, calendar, target.date(), self.cfg, current_session=True)
+                if not quotes:
+                    raise ValueError('no verified closing quotes')
+                books = await self.fetcher.fetch_books({q.code for q in quotes}, now)
+                result = self.engines['live'].update(quotes, books, target, simulated=False)
+                result.update(status='closed', mode='closed', session='closed', source='tencent',
+                              snapshot_kind='close', as_of=target.isoformat(), time=target.isoformat(),
+                              captured_at=now.isoformat(), events=[], using_cached_snapshot=True,
+                              poll_seconds=self.cfg.poll_seconds, calendar_error=self.calendar.error)
+                self.persist_snapshot(result)
+                complete = True
+                log.info('保存真实收盘快照 as_of=%s 股票=%d', target.isoformat(), len(quotes))
+            except (httpx.HTTPError, TimeoutError, ValueError):
+                log.warning('收盘快照暂未就绪，保留最近有效行情，稍后重试')
+        if self.saved_snapshot:
+            frozen = {**self.saved_snapshot}
+            engine = self.engines['live']
+            for key in ('leaders', 'anomalies', 'watchlist_leaders'):
+                for row in frozen.get(key, []):
+                    if 'price' in row:
+                        engine.rows.setdefault(row['code'], row)
+            frozen['watchlist_leaders'] = engine.watchlist_rows()
+            frozen['watchlist_anomalies'] = [r for r in frozen.get('watchlist_anomalies', [])
+                                           if r['code'] in engine.watchlist]
+            result = self.decorate_snapshot(frozen)
+            result.update(status='closed', mode='closed', session='closed', events=[], simulated=False,
+                          using_cached_snapshot=True, close_complete=complete,
+                          poll_seconds=self.cfg.poll_seconds)
+            self.broadcast(result)
+        else:
+            self.broadcast({'type': 'snapshot', 'status': 'waiting', 'mode': 'closed', 'session': 'closed',
+                            'source': 'tencent', 'simulated': False, 'stock_count': 0, 'time': None,
+                            'leaders': [], 'anomalies': [], 'watchlist_leaders': [], 'watchlist_anomalies': [],
+                            'events': [], 'error': '暂无可验证的收盘快照，等待真实行情；不展示模拟数据'})
 
     async def poll(self) -> None:
         try:
@@ -156,8 +222,8 @@ class Monitor:
                         and (self.calendar_task is None or self.calendar_task.done())):
                     self.calendar_retry_at = started + 300
                     self.calendar_task = asyncio.create_task(self.calendar.load(self.cfg, now.date()))
-                mode = "mock" if self.cfg.mock_mode or self.session == "closed" else "live"
-                if self.session == "calendar_unavailable" and not self.cfg.mock_mode:
+                mode = "closed" if self.session == "closed" else "live"
+                if self.session == "calendar_unavailable":
                     mode = "blocked"
                 if mode != self.mode:
                     self.engines["live"].clear_windows()
@@ -165,14 +231,11 @@ class Monitor:
                 try:
                     if mode == "blocked":
                         raise ValueError("calendar unavailable: live market filtering is blocked")
-                    if mode == "mock":
-                        if self.simulator is None or self.simulator_day != now.date():
-                            self.make_simulator(now)
-                        quotes, books = self.simulator.step(now)
-                        source = self.simulator.source
+                    if mode == 'closed':
+                        await self.show_closed(now)
                     else:
                         raw = await self.fetcher.fetch_market()
-                        quotes = eligible(raw, self.calendar, now.date(), self.cfg)
+                        quotes = eligible(raw, self.calendar, now.date(), self.cfg, current_session=True)
                         # f124 is the stock's last change, not the package receipt
                         # time. Quiet/auction stocks must survive a successful fetch.
                         if not quotes:
@@ -181,32 +244,40 @@ class Monitor:
                             q.code for q in quotes if q.price >= limit_price(q.pre_close)
                             or q.high >= limit_price(q.pre_close)}
                         books = await self.fetcher.fetch_books(book_codes, datetime.now(SHANGHAI))
-                        source = "eastmoney+tencent"
-                    now = datetime.now(SHANGHAI)
-                    engine = self.engines[mode]
-                    result = engine.update(quotes, books, now, simulated=mode == "mock",
+                        source = self.fetcher.source
+                    if mode == 'live':
+                        now = datetime.now(SHANGHAI)
+                        engine = self.engines[mode]
+                        result = engine.update(quotes, books, now, simulated=False,
                                            yesterday_streaks=self.calendar.yesterday_streaks
                                            if self.calendar.streaks_ready and mode == "live" else None)
-                    result["events"] = self.notifier.publish(result["events"])
-                    elapsed = time.monotonic() - started
-                    result.update({"status": "ok", "mode": mode, "source": source,
+                        result["events"] = self.notifier.publish(result["events"])
+                        elapsed = time.monotonic() - started
+                        result.update({"status": "ok", "mode": mode, "source": source,
+                                   "using_cached_snapshot": False, "last_success_age_seconds": 0.0,
                                    "session": self.session, "cycle_ms": round(elapsed * 1000, 1),
                                    "calendar_error": self.calendar.error, "poll_seconds": self.cfg.poll_seconds})
-                    self.last_success_clock = time.monotonic()
-                    self.broadcast(result)
-                    log.info("轮询 #%d %s 股票=%d 异动=%d 封板=%d 告警=%d 耗时=%.0fms",
+                        self.last_success_clock = time.monotonic()
+                        self.persist_snapshot(result)
+                        self.broadcast(result)
+                        log.info("轮询 #%d %s 股票=%d 异动=%d 封板=%d 告警=%d 耗时=%.0fms",
                              self.sequence, mode, len(quotes), len(result["anomalies"]),
                              sum(row["is_limit_up"] for row in result["leaders"]),
                              len(result["events"]), elapsed * 1000)
                 except (httpx.HTTPError, TimeoutError, ValueError) as exc:
-                    # Preserve the last good payload with a visible stale flag; no fake transitions.
-                    status = "blocked" if mode == "blocked" else "stale"
+                    # Retain the last snapshot during brief reconnects; never feed cached quotes into the engine.
+                    age = (time.monotonic() - self.last_success_clock
+                           if self.last_success_clock is not None else None)
+                    recovering = (mode == "live" and self.snapshot.get("mode") == "live"
+                                  and age is not None and age <= 60)
+                    status = "blocked" if mode == "blocked" else "recovering" if recovering else "stale"
                     aged = self.engines[mode].anomaly_board() if mode in self.engines else []
                     self.broadcast({**self.snapshot, "status": status, "mode": mode, "events": [],
                                     "anomalies": aged,
                                     "watchlist_anomalies": self.engines[mode].watchlist_board() if mode in self.engines else [],
                                     "error": str(exc) if isinstance(exc, ValueError) else type(exc).__name__,
-                                    "last_attempt": now.isoformat()})
+                                    "last_attempt": now.isoformat(), "using_cached_snapshot": True,
+                                    "last_success_age_seconds": round(age, 2) if age is not None else None})
                     log.warning("本轮不可用 mode=%s error=%s；未推进行情状态机", mode, type(exc).__name__)
                 next_tick += self.cfg.poll_seconds
                 current = asyncio.get_running_loop().time()
@@ -229,10 +300,11 @@ async def lifespan(app: FastAPI):
     async with httpx.AsyncClient(headers=HEADERS, proxy=settings.http_proxy, trust_env=False,
                                  timeout=settings.http_timeout,
                                  limits=httpx.Limits(max_connections=settings.max_concurrency,
-                                                    max_keepalive_connections=settings.max_concurrency)) as client:
+                                                    max_keepalive_connections=0)) as client:
         monitor = Monitor(client, settings)
         app.state.monitor = monitor
-        tasks = [asyncio.create_task(monitor.poll()), asyncio.create_task(monitor.notifier.worker())]
+        tasks = [asyncio.create_task(monitor.poll()), asyncio.create_task(monitor.notifier.worker()),
+                 asyncio.create_task(monitor.fetcher.sectors.run())]
         try:
             yield
         finally:
@@ -316,10 +388,6 @@ async def add_watchlist(body: WatchlistStock, request: Request, authorization: s
         stock = stocks[body.code]
         initial = {**asdict(stock), "listed": stock.listed.isoformat() if stock.listed else None,
                    "quote_missing": True, "is_watchlist": True, "simulated": False}
-        if monitor.mode == "mock" and monitor.simulator and body.code in monitor.simulator.current:
-            quote = monitor.simulator.current[body.code]
-            initial.update(asdict(quote), listed=quote.listed.isoformat() if quote.listed else None,
-                           simulated=True)
         try:
             monitor.save_watchlist(engine.watchlist | {body.code}, initial)
         except OSError as exc:

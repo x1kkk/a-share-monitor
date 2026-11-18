@@ -147,11 +147,12 @@ class Engine:
             history = self.histories.setdefault(q.code, deque(maxlen=60))
             # No cross-session, long-gap, ex-rights or cash-counter-reset deltas.
             if history and (clock - history[-1][0] > 10 or q.pre_close != history[-1][3]
-                            or q.main_inflow < history[-1][2] - 1e10):
+                            or q.main_inflow < history[-1][2] - 1e10
+                            or q.flow_epoch != history[-1][4]):
                 history.clear()
             while history and clock - history[0][0] > 120:
                 history.popleft()
-            history.append((clock, q.price, q.main_inflow, q.pre_close))
+            history.append((clock, q.price, q.main_inflow, q.pre_close, q.flow_epoch))
             old = history[0]
             speed = (q.price - old[1]) / q.pre_close * 100
             inflow = q.main_inflow - old[2]
