@@ -6,7 +6,7 @@ from dataclasses import dataclass, field
 from datetime import timedelta, timezone
 
 SHANGHAI = timezone(timedelta(hours=8), name="Asia/Shanghai")
-MOCK_MODE: bool = True
+MOCK_MODE: bool = False
 HTTP_PROXY: str | None = None
 WECHAT_WEBHOOK_URL: str = ""
 

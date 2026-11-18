@@ -15,6 +15,7 @@ import httpx
 
 from config import Settings, SHANGHAI
 from pre_market import MarketCalendar, Universe
+from sectors import SectorCache
 
 log = logging.getLogger(__name__)
 
@@ -172,6 +173,7 @@ class Fetcher:
         self.last_total: int | None = None
         self._large_page_supported = True
         self.universe = Universe(client, cfg)
+        self.sectors = SectorCache()
         self.last_books: dict[str, Book] = {}
         self.source = "tencent"
         self._flow_state: dict[str, tuple[Quote, float, float]] = {}
@@ -339,6 +341,13 @@ class Fetcher:
         return replace(q, main_inflow=main, super_inflow=super_flow, large_inflow=main - super_flow,
                        flow_source=source, flow_epoch=epoch)
 
+    def with_metadata(self, quotes: list[Quote]) -> list[Quote]:
+        result = []
+        for quote in quotes:
+            fields = self.sectors.lookup(quote.code)
+            result.append(replace(quote, **fields) if any(getattr(quote, k) != v for k, v in fields.items()) else quote)
+        return result
+
     async def fetch_market(self, *, bootstrap: bool = False) -> list[Quote]:
         today = datetime.now(SHANGHAI).date()
         stocks = await self.universe.load(today)
@@ -374,6 +383,7 @@ class Fetcher:
                                   datetime.fromtimestamp(q.source_ts, SHANGHAI).date() == today else None))
             if not quotes:
                 raise ValueError("no tradable main-board quotes")
+            quotes = self.with_metadata(quotes)
             self._flow_state = {q.code: (q, *counters[q.code]) for q in quotes}
             self.last_raw, self.last_books, self.last_total = quotes, books, len(stocks)
             self._snapshot_at = time.monotonic()
