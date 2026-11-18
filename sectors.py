@@ -13,6 +13,7 @@ import httpx
 
 from config import HEADERS, SHANGHAI
 from pre_market import save_json
+from profile_sectors import CompanySectors
 
 log = logging.getLogger(__name__)
 BASE = "https://vip.stock.finance.sina.com.cn/quotes_service/api/json_v2.php/Market_Center."
@@ -80,19 +81,24 @@ class SectorCache:
             pass
         except (OSError, ValueError, KeyError, TypeError):
             log.warning("行业/概念缓存无效，等待后台补全，不影响行情")
+        self.company = CompanySectors(self.path.parent, self._reindex)
         self._reindex()
 
     def _reindex(self) -> None:
-        index, tags = {}, {}
+        index, tags, industries = {}, {}, {}
         for node, board in sorted(self.boards.items()):
             for code in board["codes"]:
                 item = index.setdefault(code, {"industry": "", "raw_tags": ""})
                 if board["kind"] == "industry":
-                    item["industry"] = board["name"]
+                    industries.setdefault(code, set()).add(board["name"])
                 else:
                     tags.setdefault(code, set()).add(board["name"])
+        for code, names in industries.items():
+            index[code]["industry"] = next(iter(names)) if len(names) == 1 else ""
         for code, names in tags.items():
             index[code]["raw_tags"] = ",".join(sorted(names))
+        for code, profile in self.company.profiles.items():
+            index[code] = {"industry": profile["industry"], "raw_tags": profile["raw_tags"]}
         self.index = index
 
     def lookup(self, code: str) -> dict[str, str]:
@@ -184,6 +190,9 @@ class SectorCache:
                  sum(bool(v["raw_tags"]) for v in self.index.values()), failed)
 
     async def run(self) -> None:
+        await asyncio.gather(self._run_boards(), self.company.run())
+
+    async def _run_boards(self) -> None:
         async with httpx.AsyncClient(trust_env=False, headers={**HEADERS, "Referer": "https://finance.sina.com.cn/"},
                                      limits=httpx.Limits(max_connections=4, max_keepalive_connections=4)) as client:
             while True:

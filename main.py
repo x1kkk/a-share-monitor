@@ -155,7 +155,7 @@ class Monitor:
             for row in snapshot.get(key, []):
                 fields = self.fetcher.sectors.lookup(row.get('code', ''))
                 # A metadata source outage must not erase existing labels.
-                meta = {k: v for k, v in fields.items() if v}
+                meta = fields if row.get('code') in self.fetcher.sectors.index else {}
                 item = {**row, **meta}
                 item['concepts'] = [tag for tag in item.get('raw_tags', '').split(',') if tag]
                 result[key].append(item)

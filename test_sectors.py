@@ -74,7 +74,8 @@ class SectorTests(unittest.IsolatedAsyncioTestCase):
             await cache.refresh(client, TODAY)
             member_calls = [c for c in calls if 'getHQNodeData' in c]
             self.assertEqual(len(member_calls), 1)
-            self.assertEqual(cache.lookup('600002')['industry'] != '', True)
+            self.assertEqual(cache.lookup('600002')['industry'], '')
+            self.assertIn(',', cache.lookup('600002')['raw_tags'])
             calls.clear()
             restarted = SectorCache(self.path)
             self.assertEqual(restarted.index, cache.index)
@@ -132,6 +133,52 @@ class SectorTests(unittest.IsolatedAsyncioTestCase):
         for data in [[], {'version': 1, 'boards': {'hangye_0': {**old_board(), 'codes': [{}]}}}]:
             self.path.write_text(json.dumps(data), encoding='utf-8')
             self.assertEqual(SectorCache(self.path).boards, {})
+
+
+PROFILE_HTML = """<table class="comInfo1"><tr><td>所属行业板块</td></tr>
+<tr><th>行业</td><th>同行业</td></tr><tr><td>纯碱</td><td><a>点击查看</a></td></tr></table>
+<table class="comInfo1"><tr><td>所属概念板块</td></tr>
+<tr><td>煤化工</td><td><a>点击查看</a></td></tr><tr><td>储能</td><td><a>点击查看</a></td></tr></table>"""
+
+
+class CompanyTests(unittest.IsolatedAsyncioTestCase):
+    def test_profile_parse_and_incomplete_rejection(self):
+        from profile_sectors import profile_rows
+        result = profile_rows(PROFILE_HTML)
+        self.assertEqual(result['industry'], '纯碱')
+        self.assertEqual(set(result['raw_tags'].split(',')), {'储能', '煤化工'})
+        for invalid in ['captcha', PROFILE_HTML.rsplit('</table>', 1)[0]]:
+            with self.assertRaises(ValueError):
+                profile_rows(invalid)
+
+    async def test_profile_override_retry_restart_and_conflicts(self):
+        with tempfile.TemporaryDirectory() as directory:
+            directory = Path(directory)
+            (directory / 'universe_cache.json').write_text(json.dumps({'stocks': [{'code': '000707'}]}), encoding='utf-8')
+            cache = SectorCache(directory / 'sector_cache.json')
+            cache.boards = {'hangye_a': {**old_board(), 'name': '化工', 'codes': ['000707']},
+                            'hangye_b': {**old_board(), 'name': '金属机械修理', 'codes': ['000707']}}
+            cache._reindex()
+            self.assertEqual(cache.lookup('000707')['industry'], '')
+            calls = []
+            invalid = False
+            def handler(request):
+                calls.append(str(request.url))
+                return httpx.Response(200, content=('bad' if invalid else PROFILE_HTML).encode('gb18030'))
+            async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+                await cache.company.refresh(client, TODAY)
+                self.assertEqual(cache.lookup('000707')['industry'], '纯碱')
+                await cache.company.refresh(client, TODAY)
+                self.assertEqual(len(calls), 1)
+                restarted = SectorCache(directory / 'sector_cache.json')
+                self.assertEqual(restarted.lookup('000707'), cache.lookup('000707'))
+                original = (directory / 'company_sectors.json').read_bytes()
+                invalid = True
+                await restarted.company.refresh(client, date(2026, 11, 19))
+                self.assertEqual(restarted.lookup('000707')['industry'], '纯碱')
+                self.assertEqual((directory / 'company_sectors.json').read_bytes(), original)
+                await restarted.company.refresh(client, date(2026, 11, 19))
+                self.assertEqual(len(calls), 3)
 
 
 if __name__ == '__main__':

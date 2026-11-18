@@ -22,3 +22,4 @@ sector_cache.json
 market_snapshot.json
 market_calendar_cache.json
 .market-*.tmp
+company_sectors.json
