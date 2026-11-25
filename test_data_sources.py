@@ -151,6 +151,47 @@ class TencentSnapshotChecks(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(third.flow_epoch, second.flow_epoch + 1)
         self.assertEqual(third.super_inflow + third.large_inflow, third.main_inflow)
 
+    async def test_transient_disconnect_retries_only_the_failed_batch(self):
+        failed = False
+
+        def once(codes, lines, request):
+            nonlocal failed
+            if not failed:
+                failed = True
+                raise httpx.RemoteProtocolError("transient reset", request=request)
+            return lines
+
+        self.mutation = once
+        quotes = await self.fetcher.fetch_market()
+        self.assertEqual(len(quotes), 2)
+        self.assertEqual(sum(not flow for flow, _ in self.requests), 2)
+
+    async def test_older_stock_snapshot_preserves_its_baseline_without_blocking_peers(self):
+        code, other = self.stocks
+        first = {q.code: q for q in await self.fetcher.fetch_market()}[code]
+        baseline = self.fetcher._flow_state[code]
+        old_time = self.now - timedelta(seconds=2)
+        self.now += timedelta(seconds=2)
+        self.amount, self.buy, self.sell, self.volume = 110, 95, 25, 1100
+
+        def old_stock(codes, lines, request):
+            return [quote_line(c, old_time, amount=90, buy=70, sell=20, volume=900,
+                               invalid={3: 9.5}) if c == code else line
+                    for c, line in zip(codes, lines)]
+
+        self.mutation = old_stock
+        second = {q.code: q for q in await self.fetcher.fetch_market()}
+        self.assertIs(second[code], first)
+        self.assertEqual(self.fetcher._flow_state[code], baseline)
+        self.assertEqual(second[other].amount, 1100000)
+        self.assertNotIn(code, self.fetcher.last_books)
+        self.mutation = None
+        self.now += timedelta(seconds=2)
+        self.amount, self.buy, self.sell, self.volume = 120, 110, 30, 1200
+        third = {q.code: q for q in await self.fetcher.fetch_market()}[code]
+        self.assertEqual(third.main_inflow, 700000)
+        self.assertEqual(third.flow_epoch, first.flow_epoch)
+
     async def test_counter_rollback_and_new_day_reset_flow_baseline(self):
         code, other = self.stocks
         self.flow_values = {other: (self.now.date(), 3.5)}

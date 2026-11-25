@@ -21,3 +21,6 @@ universe_cache.json
 market_calendar_cache.json
 .market-*.tmp
 monitor_filters.json
+sector_cache.json
+market_snapshot.json
+company_sectors.json
