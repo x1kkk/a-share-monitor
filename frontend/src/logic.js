@@ -1,24 +1,56 @@
 export const DEFAULT_WEIGHTS = { speed_2m: 35, main_inflow: 20, turnover: 20, large_inflow: 15, amount: 10 }
 export const WEIGHT_LABELS = { speed_2m: '2分钟涨速', main_inflow: '主力净流入', turnover: '换手率', large_inflow: '大单净流入', amount: '成交额' }
-export function numeric(value) { return value !== null && value !== undefined && value !== '' && Number.isFinite(Number(value)) }
+export const DEFAULT_FILTERS = { sensitivity: 'balanced', exclude_st: false, exclude_low_amount: false }
+export function numeric(value) { return (typeof value === 'number' || typeof value === 'string' && value.trim() !== '') && Number.isFinite(Number(value)) }
+export function numberText(value, digits = 2) { return numeric(value) ? Number(value).toFixed(digits) : '--' }
 export function money(value) {
-  if (!numeric(value)) return '—'
+  if (!numeric(value)) return '--'
   const number = Number(value), absolute = Math.abs(number)
   if (absolute >= 1e8) return `${(number / 1e8).toFixed(2)}亿`
   if (absolute >= 1e4) return `${(number / 1e4).toFixed(2)}万`
   return number.toFixed(2)
 }
 export function percent(value, signed = false) {
-  if (!numeric(value)) return '—'
+  if (!numeric(value)) return '--'
   const number = Number(value)
   return `${signed && number > 0 ? '+' : ''}${number.toFixed(2)}%`
 }
 export function localTime(value, seconds = true) {
-  if (!value) return '—'
+  if (!value) return '--'
   const date = new Date(value)
-  return Number.isNaN(date.getTime()) ? '—' : date.toLocaleTimeString('zh-CN', { timeZone: 'Asia/Shanghai', hour12: false, hour: '2-digit', minute: '2-digit', ...(seconds ? { second: '2-digit' } : {}) })
+  return Number.isNaN(date.getTime()) ? '--' : date.toLocaleTimeString('zh-CN', { timeZone: 'Asia/Shanghai', hour12: false, hour: '2-digit', minute: '2-digit', ...(seconds ? { second: '2-digit' } : {}) })
 }
-export function rowAge(row, elapsedSeconds) { return Math.max(0, (Number(row.age_seconds) || 0) + elapsedSeconds) }
+export function rowAge(row, elapsedSeconds) { return numeric(row.age_seconds) && numeric(elapsedSeconds) ? Math.max(0, Number(row.age_seconds) + Number(elapsedSeconds)) : null }
+export function signalDirection(row) {
+  if (row.direction === 'bullish' || row.direction === 'bearish') return row.direction
+  const type = row.signal_type || row.event_type
+  return ['heavy_plunge', 'break_open'].includes(type) ? 'bearish' : ['rapid_rise', 'limit_up', 'anomaly'].includes(type) ? 'bullish' : ''
+}
+export function signalLabel(row) {
+  return row.signal_label || ({ rapid_rise: '急速拉升', heavy_plunge: '放量跳水', limit_up: '首次封板', break_open: '炸板告警', anomaly: '新异动' }[row.signal_type || row.event_type]) || '市场信号'
+}
+export function filterSignals(rows, direction = 'all') { return direction === 'all' ? rows : rows.filter(row => signalDirection(row) === direction) }
+export function rowLifetime(row, elapsedSeconds, ttl) {
+  const age = rowAge(row, elapsedSeconds)
+  const expired = row.status === 'expired' || age !== null && numeric(ttl?.active_seconds) && age >= Number(ttl.active_seconds)
+  if (age === null || !numeric(ttl?.remove_seconds) || Number(ttl.remove_seconds) <= 0) return { remaining: null, ratio: null, expired }
+  const remaining = Math.max(0, Number(ttl.remove_seconds) - age)
+  return { remaining, ratio: Math.min(1, remaining / Number(ttl.remove_seconds)), expired }
+}
+// Only editable settings leave the browser; derived thresholds stay server-owned.
+export function filterPayload(value) {
+  return { sensitivity: value.sensitivity, exclude_st: value.exclude_st, exclude_low_amount: value.exclude_low_amount }
+}
+export function sameFilters(left, right) { return Object.keys(DEFAULT_FILTERS).every(key => left?.[key] === right?.[key]) }
+export function canSyncFilters(value, acknowledged, now = Date.now()) {
+  return !acknowledged || now >= acknowledged.until || sameFilters(value, acknowledged.filters)
+}
+// Alert level controls repeat count, while direction controls pitch.
+export function alertNotes(event = {}) {
+  const level = Number(event.alert_level)
+  const count = Number.isInteger(level) && level >= 1 && level <= 3 ? level : 1
+  return Array(count).fill(signalDirection(event) === 'bearish' ? 392 : 1047)
+}
 export function eventGate(limit = 2000) {
   const seen = new Set()
   return {

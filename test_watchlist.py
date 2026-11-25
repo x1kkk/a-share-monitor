@@ -56,12 +56,17 @@ class WatchlistEngineChecks(unittest.TestCase):
         result = engine.update([seed[0], sealed], {}, now, clock=2)
         self.assertEqual(result['watchlist_leaders'][0]['code'], q.code)
         self.assertEqual(result['watchlist_anomalies'][0]['event_type'], 'limit_up')
+        self.assertEqual(result['events'][0]['direction'], 'bullish')
+        self.assertEqual(result['events'][0]['signal_type'], 'limit_up')
+        self.assertEqual(result['events'][0]['alert_level'], 3)
         result = engine.update([], {}, now, clock=4)
         self.assertEqual(len(result['watchlist_leaders']), 2)
         self.assertTrue(result['watchlist_anomalies'][0]['quote_missing'])
         result = engine.update(seed, {}, now, clock=6)
         self.assertEqual(result['watchlist_anomalies'][0]['event_type'], 'break_open')
         self.assertTrue(result['events'][0]['is_watchlist'])
+        self.assertEqual(result['events'][0]['direction'], 'bearish')
+        self.assertEqual(result['events'][0]['signal_type'], 'break_open')
         result = engine.update(seed, {}, now + timedelta(days=1), clock=8)
         self.assertEqual(len(result['watchlist_leaders']), 2)
         self.assertEqual(result['watchlist_anomalies'], [])
@@ -148,6 +153,188 @@ class WatchlistApiChecks(unittest.TestCase):
                 path.write_text(invalid)
                 with self.assertRaises(ValueError):
                     main.Monitor(None, Settings(), watchlist_path=path)
+                self.assertEqual(path.read_text(), invalid)
+
+
+class FilterUpgradeChecks(unittest.TestCase):
+    def test_noise_settings_do_not_retrigger_or_refresh_existing_vip(self):
+        now = datetime(2026, 11, 26, 10, tzinfo=SHANGHAI)
+        q = replace(demo_seed()[0], pre_close=10, price=10, high=10)
+        engine = Engine(Settings())
+        engine.watchlist = {q.code}
+        engine.update([q], {}, now, clock=0)
+        q = replace(q, price=10.3, main_inflow=5e6)
+        first = engine.update([q], {}, now + timedelta(seconds=2), clock=2)
+        self.assertEqual(len(first['events']), 1)
+        reason = first['watchlist_anomalies'][0]['reason']
+        # Neither a purely ordinary-scan toggle nor an identical write is a
+        # new false->true VIP market transition.
+        for second in (4, 6):
+            engine.set_filters({'exclude_st': True, 'exclude_low_amount': True})
+            result = engine.update([q], {}, now + timedelta(seconds=second), clock=second)
+            self.assertEqual(result['events'], [])
+            self.assertEqual(result['watchlist_anomalies'][0]['age_seconds'], second - 2)
+            self.assertEqual(result['watchlist_anomalies'][0]['reason'], reason)
+        # A real opposite-direction transition still refreshes the VIP radar.
+        result = engine.update([replace(q, price=9.7, main_inflow=-5e6)], {},
+                               now + timedelta(seconds=8), clock=8)
+        self.assertEqual(result['events'][0]['signal_type'], 'heavy_plunge')
+        self.assertEqual(result['watchlist_anomalies'][0]['age_seconds'], 0)
+
+    def test_opposite_direction_notices_have_independent_cooldowns_and_reasons(self):
+        now = datetime(2026, 11, 26, 10, tzinfo=SHANGHAI)
+        q = replace(demo_seed()[0], pre_close=10, price=10, high=10)
+        engine = Engine(Settings())
+        engine.update([q], {}, now, clock=0)
+        rise = engine.update([replace(q, price=10.3, main_inflow=5e6)], {},
+                             now + timedelta(seconds=2), clock=2)['events']
+        plunge = engine.update([replace(q, price=9.7, main_inflow=-5e6)], {},
+                               now + timedelta(seconds=4), clock=4)['events']
+        notifier = Notifier(None, replace(Settings(), wechat_webhook_url=''))
+        first = notifier.publish(rise, clock=2)
+        second = notifier.publish(plunge, clock=4)
+        self.assertEqual(len(first), 1)
+        self.assertEqual(len(second), 1)
+        self.assertEqual(second[0]['direction'], 'bearish')
+        self.assertIn(second[0]['reason'], notifier.markdown(second[0]))
+        self.assertIn('放量跳水', notifier.markdown(second[0]))
+        self.assertNotEqual(first[0]['id'], second[0]['id'])
+
+    def test_filters_only_suppress_ordinary_scans_and_survive_day_rollover(self):
+        now = datetime(2026, 11, 26, 10, tzinfo=SHANGHAI)
+        base = replace(demo_seed()[0], pre_close=10, price=10, high=10)
+        seeds = [replace(base, code='600001', name='*sT测试', amount=2e8),
+                 replace(base, code='600002', name='小成交额', amount=1e7),
+                 replace(base, code='600003', name='正常股票', amount=2e8)]
+        filters = {'sensitivity': 'balanced', 'exclude_st': True,
+                   'exclude_low_amount': True, 'min_daily_amount': 100_000_000}
+        ordinary = Engine(Settings())
+        ordinary.set_filters(filters)
+        ordinary.update(seeds, {}, now, clock=0)
+        raised = [replace(q, price=10.3, main_inflow=5e6) for q in seeds]
+        result = ordinary.update(raised, {}, now + timedelta(seconds=2), clock=2)
+        self.assertEqual([r['code'] for r in result['anomalies']], ['600003'])
+        self.assertEqual(len(result['leaders']), 3)
+        self.assertEqual(result['filters']['sensitivity'], 'balanced')
+        # The exact same ST/low-amount quotes remain eligible for explicit VIPs.
+        vip = Engine(Settings())
+        vip.set_filters(filters)
+        vip.watchlist = {q.code for q in seeds}
+        vip.update(seeds, {}, now, clock=0)
+        result = vip.update(raised, {}, now + timedelta(seconds=2), clock=2)
+        self.assertEqual({r['code'] for r in result['watchlist_anomalies']}, vip.watchlist)
+        self.assertTrue(all(e['alert_level'] == 3 for e in result['events']))
+        self.assertEqual(result['minute_admitted_by_direction'], {'bullish': 0, 'bearish': 0})
+        result = vip.update(seeds, {}, now + timedelta(days=1), clock=4)
+        self.assertTrue(result['filters']['exclude_st'])
+        self.assertTrue(result['filters']['exclude_low_amount'])
+        self.assertEqual(result['watchlist_anomalies'], [])
+        # Both switches default off, including ST at the Engine boundary.
+        default = Engine(Settings())
+        default.update(seeds, {}, now, clock=0)
+        result = default.update(raised, {}, now + timedelta(seconds=2), clock=2)
+        self.assertEqual(len(result['anomalies']), 3)
+
+    def test_vip_plunge_uses_negative_cumulative_or_negative_window_flow(self):
+        now = datetime(2026, 11, 26, 10, tzinfo=SHANGHAI)
+        q = replace(demo_seed()[0], price=10, pre_close=10, high=10, main_inflow=-5e6)
+        vip = Engine(Settings())
+        vip.watchlist = {q.code}
+        vip.update([q], {}, now, clock=0)
+        # Positive delta but negative cumulative flow is a VIP risk signal.
+        changed = replace(q, price=9.7, main_inflow=-4e6)
+        result = vip.update([changed], {}, now + timedelta(seconds=2), clock=2)
+        event = result['events'][0]
+        self.assertEqual(event['signal_type'], 'heavy_plunge')
+        self.assertEqual(event['alert_level'], 3)
+        self.assertTrue(event['is_watchlist'])
+        self.assertIn('当日累计主力净流出', event['reason'])
+        self.assertEqual(result['minute_admitted_by_direction']['bearish'], 0)
+        ordinary = Engine(Settings())
+        ordinary.update([q], {}, now, clock=0)
+        result = ordinary.update([changed], {}, now + timedelta(seconds=2), clock=2)
+        self.assertEqual(result['events'], [])
+
+    def test_filter_presets_change_speed_threshold(self):
+        now = datetime(2026, 11, 26, 10, tzinfo=SHANGHAI)
+        q = replace(demo_seed()[0], price=10, pre_close=10, high=10)
+        for sensitivity, speed, volume, expected in (
+                ('conservative', 3.0, 3.0, False),
+                ('balanced', 2.0, 2.0, False),
+                ('sensitive', 1.0, 1.5, True)):
+            with self.subTest(sensitivity=sensitivity):
+                engine = Engine(Settings())
+                engine.set_filters({'sensitivity': sensitivity})
+                engine.update([q], {}, now, clock=0)
+                result = engine.update([replace(q, price=10.15, main_inflow=5e6)], {},
+                                       now + timedelta(seconds=2), clock=2)
+                self.assertEqual(bool(result['anomalies']), expected)
+                self.assertEqual(result['filters']['rise_speed_threshold'], speed)
+                self.assertEqual(result['filters']['plunge_speed_threshold'], speed)
+                self.assertEqual(result['filters']['vol_ratio_threshold'], volume)
+
+    def test_filter_api_auth_validation_persistence_broadcast_and_atomic_failure(self):
+        cfg = replace(Settings(), api_token='filters-test', wechat_webhook_url='')
+        body = {'sensitivity': 'sensitive', 'exclude_st': True, 'exclude_low_amount': True}
+        with tempfile.TemporaryDirectory() as directory:
+            folder = Path(directory)
+            path = folder / 'monitor_filters.json'
+            monitor = main.Monitor(None, cfg, watchlist_path=folder / 'watchlist.json', filters_path=path)
+
+            @asynccontextmanager
+            async def lifespan(app):
+                app.state.monitor = monitor
+                yield
+
+            with patch.object(main, 'settings', cfg), patch.object(main.app.router, 'lifespan_context', lifespan):
+                with TestClient(main.app) as client:
+                    headers = {'authorization': 'Bearer ' + cfg.api_token, 'origin': 'http://localhost:5173'}
+                    self.assertEqual(client.get('/api/filters').status_code, 401)
+                    self.assertEqual(client.put('/api/filters', json=body).status_code, 401)
+                    self.assertEqual(client.put('/api/filters', headers={**headers, 'origin': 'https://evil.invalid'},
+                                                json=body).status_code, 403)
+                    for invalid in ({**body, 'sensitivity': 'unknown'}, {**body, 'exclude_st': 'true'},
+                                    {**body, 'min_daily_amount': -1}, {**body, 'min_daily_amount': True},
+                                    {**body, 'unexpected': 1}):
+                        self.assertEqual(client.put('/api/filters', headers=headers, json=invalid).status_code, 422)
+                    with client.websocket_connect('/ws', headers={'origin': headers['origin']}) as ws:
+                        ws.send_json({'token': cfg.api_token})
+                        initial = ws.receive_json()
+                        self.assertIn('ttl', initial)
+                        self.assertEqual(initial['filters']['sensitivity'], 'balanced')
+                        response = client.put('/api/filters', headers=headers, json=body)
+                        self.assertEqual(response.status_code, 200)
+                        snapshot = ws.receive_json()
+                        self.assertEqual(snapshot['events'], [])
+                        self.assertEqual(snapshot['filters'], response.json()['filters'])
+                    saved = path.read_bytes()
+                    persisted = json.loads(saved)
+                    self.assertEqual(persisted['sensitivity'], 'sensitive')
+                    self.assertEqual(persisted['min_daily_amount'], 100_000_000)
+                    # Settings are applied to both engines and survive restart.
+                    for engine in monitor.engines.values():
+                        snap = engine.update([], {}, datetime.now(SHANGHAI), clock=0)
+                        self.assertEqual(snap['filters']['sensitivity'], 'sensitive')
+                    restored = main.Monitor(None, cfg, watchlist_path=folder / 'watchlist.json', filters_path=path)
+                    self.assertEqual(restored.snapshot['filters']['sensitivity'], 'sensitive')
+                    previous = client.get('/api/filters', headers=headers).json()
+                    for operation in ('main.os.replace', 'main.os.fsync'):
+                        with patch(operation, side_effect=OSError('disk unavailable')):
+                            response = client.put('/api/filters', headers=headers,
+                                                  json={**body, 'sensitivity': 'conservative'})
+                        self.assertEqual(response.status_code, 503)
+                        self.assertEqual(path.read_bytes(), saved)
+                        self.assertEqual(client.get('/api/filters', headers=headers).json(), previous)
+                        self.assertEqual(list(folder.glob('*.tmp')), [])
+
+    def test_corrupt_filter_file_is_not_overwritten(self):
+        with tempfile.TemporaryDirectory() as directory:
+            folder = Path(directory)
+            path = folder / 'monitor_filters.json'
+            for invalid in ('{bad', '[]', '{"sensitivity":"unknown"}', '{"exclude_st":"false"}'):
+                path.write_text(invalid)
+                with self.assertRaises(ValueError):
+                    main.Monitor(None, Settings(), watchlist_path=folder / 'watchlist.json', filters_path=path)
                 self.assertEqual(path.read_text(), invalid)
 
 

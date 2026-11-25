@@ -20,3 +20,4 @@ watchlist.json
 universe_cache.json
 market_calendar_cache.json
 .market-*.tmp
+monitor_filters.json

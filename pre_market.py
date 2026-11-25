@@ -52,7 +52,7 @@ def stock_rows(rows: list[dict]) -> dict[str, dict]:
     result = {}
     for row in rows:
         code, name = str(row.get("code", "")), str(row.get("name", "")).strip()
-        if not re.fullmatch(r"(?:00|60)[0-9]{4}", code) or not name or "ST" in name.upper() or "退" in name:
+        if not re.fullmatch(r"(?:00|60)[0-9]{4}", code) or not name or "退" in name:
             continue
         item = {"code": code, "name": name, "listed": None}
         for key in ("listed", "observed_since"):
@@ -173,6 +173,7 @@ class Universe:
         if self.loaded_for == today:
             return self.stocks
         cached_date = None
+        cache_includes_st = False
         try:
             data = json.loads(self.path.read_text(encoding="utf-8"))
             cached = stock_rows(data["stocks"])
@@ -180,15 +181,19 @@ class Universe:
                 raise ValueError("incomplete universe cache")
             self.stocks = cached
             cached_date = date.fromisoformat(data["updated_for"])
+            cache_includes_st = data.get("includes_st") is True
         except FileNotFoundError:
             pass
         except (OSError, ValueError, TypeError, KeyError):
             log.warning("股票池缓存损坏/不完整，将尝试重新获取完整代码表")
-        if cached_date == today:
+        # Old versions permanently removed ST upstream. Refresh even same-day
+        # legacy caches once; a failed refresh still retains the complete old pool.
+        if cached_date == today and cache_includes_st:
             await self._listing_dates(self.stocks)
             self.loaded_for = today
             try:
-                save_json(self.path, {"updated_for": today.isoformat(), "stocks": list(self.stocks.values())})
+                save_json(self.path, {"updated_for": today.isoformat(), "includes_st": True,
+                                      "stocks": list(self.stocks.values())})
             except OSError:
                 log.warning("股票池缓存写入失败", exc_info=True)
             return self.stocks
@@ -222,6 +227,7 @@ class Universe:
         await self._listing_dates(stocks)
         try:
             save_json(self.path, {"updated_for": (today if len(refreshed) == 2 else cached_date or date.min).isoformat(),
+                                  "includes_st": len(refreshed) == 2 or cache_includes_st,
                                   "stocks": list(stocks.values())})
         except OSError:
             log.warning("股票池缓存写入失败；使用完整内存股票池", exc_info=True)

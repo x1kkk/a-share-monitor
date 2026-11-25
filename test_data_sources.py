@@ -15,8 +15,8 @@ import httpx
 
 from config import SHANGHAI, Settings
 from engine import Engine
-from fetcher import Fetcher, demo_seed, eligible, parse_flows, parse_tencent
-from pre_market import MarketCalendar, Universe
+from fetcher import Fetcher, Simulator, demo_seed, eligible, parse_flows, parse_tencent, parse_quote
+from pre_market import MarketCalendar, Universe, stock_rows
 
 
 def stock_pool(count=3050):
@@ -190,8 +190,26 @@ class PreMarketCacheChecks(unittest.IsolatedAsyncioTestCase):
         self.universe = Universe(self.client, Settings(), path=self.path)
 
     def cache(self, updated_for, stocks=None):
-        self.path.write_text(json.dumps({"updated_for": updated_for.isoformat(),
+        self.path.write_text(json.dumps({"updated_for": updated_for.isoformat(), "includes_st": True,
                                          "stocks": list((stocks or self.stocks).values())}), encoding="utf-8")
+
+    async def test_legacy_same_day_pool_refreshes_to_include_st(self):
+        self.cache(self.today)
+        data = json.loads(self.path.read_text(encoding="utf-8"))
+        del data["includes_st"]
+        self.path.write_text(json.dumps(data), encoding="utf-8")
+        full = copy.deepcopy(self.stocks)
+        code = next(iter(full))
+        full[code]["name"] = "*ST测试"
+
+        async def exchange(prefix):
+            return {c: r for c, r in full.items() if c.startswith(prefix)}
+
+        with patch.object(self.universe, "_exchange", side_effect=exchange) as source:
+            loaded = await self.universe.load(self.today)
+        self.assertEqual(source.call_count, 2)
+        self.assertEqual(loaded[code]["name"], "*ST测试")
+        self.assertTrue(json.loads(self.path.read_text(encoding="utf-8"))["includes_st"])
 
     async def test_same_day_complete_cache_loads_without_network(self):
         self.cache(self.today)
@@ -311,6 +329,45 @@ class PreMarketCacheChecks(unittest.IsolatedAsyncioTestCase):
 
 
 class SourceBoundaryChecks(unittest.TestCase):
+    def test_st_survives_metadata_and_both_quote_adapters(self):
+        now = datetime(2026, 11, 26, 10, tzinfo=SHANGHAI)
+        stocks = stock_rows([{"code": "600001", "name": "*ST测试", "listed": "2010-01-04"}])
+        self.assertIn("600001", stocks)
+        quotes, _, _ = parse_tencent(quote_line("600001", now, invalid={1: "*ST测试"}), stocks)
+        self.assertEqual(quotes["600001"].name, "*ST测试")
+        parsed = parse_quote({"f12": "600001", "f14": "*ST测试", "f2": 10, "f3": 0,
+                              "f5": 100, "f6": 1e6, "f8": 1, "f18": 10, "f21": 1e9,
+                              "f62": 0, "f66": 0, "f72": 0}, now=now)
+        self.assertIsNotNone(parsed)
+
+    def test_live_metadata_dates_remain_json_serializable_in_new_snapshots(self):
+        now = datetime(2026, 11, 26, 10, tzinfo=SHANGHAI)
+        quote = replace(demo_seed()[0], observed_since=now.date())
+        engine = Engine(Settings())
+        engine.watchlist = {quote.code}
+        result = engine.update([quote], {}, now, clock=0)
+        self.assertEqual(result["leaders"][0]["observed_since"], "2026-11-26")
+        json.dumps(result, allow_nan=False)
+
+    def test_simulator_repeats_bullish_bearish_and_limit_events(self):
+        cfg = Settings()
+        simulator, engine = Simulator(demo_seed(), cfg, "test_demo"), Engine(cfg)
+        now = datetime(2026, 11, 26, 10, tzinfo=SHANGHAI)
+        per_cycle = [set(), set()]
+        warm_plunges = []
+        for tick in range(480):
+            current = now + timedelta(seconds=tick * 2)
+            quotes, books = simulator.step(current)
+            result = engine.update(quotes, books, current, clock=tick * 2, simulated=True)
+            per_cycle[tick // 240].update(e["signal_type"] for e in result["events"])
+            warm_plunges.extend(e for e in result["events"] if e["signal_type"] == "heavy_plunge"
+                                and e["vol_ratio"] is not None)
+        for signals in per_cycle:
+            self.assertTrue({"rapid_rise", "heavy_plunge", "break_open"} <= signals)
+        self.assertIn("limit_up", per_cycle[0])
+        self.assertNotIn("limit_up", per_cycle[1])  # same-day reseals are not first seals
+        self.assertTrue(warm_plunges)
+
     def test_eligible_rejects_previous_day_and_honors_fifteenth_session(self):
         today = date(2026, 11, 10)
         sessions = [today - timedelta(days=i) for i in range(14, -1, -1)]

@@ -38,6 +38,158 @@ class StateChecks(unittest.TestCase):
             self.assertIsNone(parse_quote(row, now=now.replace(minute=minute)))
 
 
+class BidirectionalChecks(unittest.TestCase):
+    def setUp(self):
+        self.now = datetime(2026, 11, 26, 10, tzinfo=SHANGHAI)
+        self.quote = replace(demo_seed()[0], price=10, pre_close=10, high=10,
+                             main_inflow=0, volume=1_000_000, amount=2e8)
+
+    def tick(self, engine, quotes, second):
+        return engine.update(quotes, {}, self.now + timedelta(seconds=second), clock=second)
+
+    def test_one_minute_speed_volume_ratio_and_cold_start(self):
+        engine = Engine(Settings())
+        for second in range(0, 121, 2):
+            # Startup cumulative volume must not leak into the baseline. The
+            # prior minute is 10 lots/s; current minute is 30 lots/s.
+            volume = self.quote.volume + min(second, 60) * 10 + max(0, second - 60) * 30
+            price = 10 + min(second, 60) * .001 - max(0, second - 60) * .002
+            result = self.tick(engine, [replace(self.quote, price=price, volume=volume)], second)
+            row = result['leaders'][0]
+            if second < 120:
+                self.assertIsNone(row['vol_ratio'])
+        self.assertAlmostEqual(row['vol_ratio'], 3)
+        self.assertAlmostEqual(row['speed_1m'], -1.2)
+        self.assertEqual(row['window_1m_seconds'], 60)
+        self.assertLessEqual(row['window_1m_seconds'], 60)
+        self.assertNotEqual(row['speed_1m'], row['speed_2m'])
+        # Cutover must discard both the price and volume history.
+        result = self.tick(engine, [replace(self.quote, price=10.4, volume=2_000_000,
+                                           main_inflow=1e9, flow_epoch=1)], 122)
+        row = result['leaders'][0]
+        self.assertIsNone(row['speed_1m'])
+        self.assertEqual(row['window_1m_seconds'], 0)
+        self.assertIsNone(row['vol_ratio'])
+        self.assertEqual(result['events'], [])
+
+    def test_zero_baseline_degrades_without_inventing_volume(self):
+        engine = Engine(Settings())
+        for second in range(0, 121, 2):
+            self.tick(engine, [self.quote], second)
+        result = self.tick(engine, [replace(self.quote, price=10.3, main_inflow=5e6)], 122)
+        event = next(e for e in result['events'] if e['event_type'] == 'anomaly')
+        self.assertIsNone(event['vol_ratio'])
+        self.assertEqual(event['signal_type'], 'rapid_rise')
+        self.assertNotIn('None', event['reason'])
+        self.assertNotIn('NaN', event['reason'])
+        self.assertNotIn('量比0', event['reason'])
+
+    def test_ready_volume_baseline_enforces_threshold(self):
+        engine = Engine(Settings())
+        for second in range(0, 121, 2):
+            self.tick(engine, [replace(self.quote, volume=self.quote.volume + second * 10)], second)
+        result = self.tick(engine, [replace(self.quote, price=10.3, main_inflow=5e6,
+                                           volume=self.quote.volume + 122 * 10)], 122)
+        self.assertAlmostEqual(result['leaders'][0]['vol_ratio'], 1)
+        self.assertEqual(result['anomalies'], [])
+        self.assertEqual(result['events'], [])
+
+    def test_direction_limits_scores_and_protocol_are_independent(self):
+        # 12 candidates per direction exercise both independent admission caps.
+        seeds = [replace(self.quote, code=f'600{i:03d}') for i in range(24)]
+        changed = [replace(q, price=10.3 if i < 12 else 9.7,
+                           main_inflow=5e6 if i < 12 else -5e6)
+                   for i, q in enumerate(seeds)]
+        engine = Engine(Settings())
+        self.tick(engine, seeds, 0)
+        result = self.tick(engine, changed, 2)
+        counts = {direction: sum(r['direction'] == direction for r in result['anomalies'])
+                  for direction in ('bullish', 'bearish')}
+        self.assertEqual(counts, {'bullish': 10, 'bearish': 10})
+        self.assertEqual(result['pending_count'], 4)
+        self.assertEqual(len(result['events']), 20)
+        for event in result['events']:
+            bullish = event['direction'] == 'bullish'
+            self.assertEqual(event['signal_type'], 'rapid_rise' if bullish else 'heavy_plunge')
+            self.assertEqual(event['signal_label'], '急速拉升' if bullish else '放量跳水')
+            self.assertIn(event['signal_label'], event['signal_tags'])
+            self.assertIn(event['signal_label'], event['reason'])
+            self.assertEqual(event['alert_level'], 2)
+        # Changing the other direction's population cannot change the score.
+        bullish_only = Engine(Settings())
+        self.tick(bullish_only, seeds[:12], 0)
+        self.tick(bullish_only, changed[:12], 2)
+        for q in seeds[:12]:
+            self.assertEqual(engine.rows[q.code]['score'], bullish_only.rows[q.code]['score'])
+        bearish_only = Engine(Settings())
+        self.tick(bearish_only, seeds[12:], 0)
+        self.tick(bearish_only, changed[12:], 2)
+        for q in seeds[12:]:
+            self.assertEqual(engine.rows[q.code]['score'], bearish_only.rows[q.code]['score'])
+
+    def test_plunge_at_lower_limit_is_not_an_ordinary_anomaly(self):
+        engine = Engine(Settings())
+        self.tick(engine, [self.quote], 0)
+        result = self.tick(engine, [replace(self.quote, price=9, main_inflow=-5e6)], 2)
+        self.assertEqual(result['anomalies'], [])
+        self.assertFalse(any(e['event_type'] == 'anomaly' for e in result['events']))
+
+    def test_simultaneous_break_and_plunge_keep_distinct_signal_protocols(self):
+        engine = Engine(Settings())
+        sealed = replace(self.quote, price=11, high=11, main_inflow=1e7)
+        self.tick(engine, [sealed], 0)
+        result = self.tick(engine, [replace(sealed, price=10.7, main_inflow=5e6)], 2)
+        self.assertEqual(len(result['events']), 2)
+        broken = next(e for e in result['events'] if e['event_type'] == 'break_open')
+        plunge = next(e for e in result['events'] if e['event_type'] == 'anomaly')
+        self.assertEqual((broken['signal_type'], broken['alert_level']), ('break_open', 3))
+        self.assertEqual((plunge['signal_type'], plunge['alert_level']), ('heavy_plunge', 2))
+        self.assertIn('放量跳水', plunge['reason'])
+        self.assertEqual(result['anomalies'][0]['signal_type'], 'heavy_plunge')
+        self.assertEqual(result['anomalies'][0]['reason'], plunge['reason'])
+
+    def test_counter_rollback_and_gap_clear_new_windows(self):
+        for reset_kind in ('volume', 'amount', 'gap'):
+            with self.subTest(reset_kind=reset_kind):
+                engine = Engine(Settings())
+                for second in range(0, 121, 2):
+                    q = replace(self.quote, volume=self.quote.volume + second * 10,
+                                amount=self.quote.amount + second * 1000)
+                    self.tick(engine, [q], second)
+                second = 140 if reset_kind == 'gap' else 122
+                changes = {'price': 9.6, 'main_inflow': -1e7}
+                if reset_kind == 'volume':
+                    changes['volume'] = 10
+                elif reset_kind == 'amount':
+                    changes['amount'] = 10
+                result = self.tick(engine, [replace(q, **changes)], second)
+                row = result['leaders'][0]
+                self.assertIsNone(row['vol_ratio'])
+                self.assertIsNone(row['speed_1m'])
+                self.assertEqual(result['events'], [])
+
+    def test_bearish_urgency_and_missing_quote_do_not_distort_ranks(self):
+        seeds = [replace(self.quote, code='600001'), replace(self.quote, code='600002')]
+        engine = Engine(Settings())
+        self.tick(engine, seeds, 0)
+        changed = [replace(seeds[0], price=9.7, main_inflow=-3e6),
+                   replace(seeds[1], price=9.5, main_inflow=-8e6)]
+        result = self.tick(engine, changed, 2)
+        self.assertGreater(engine.rows['600002']['score'], engine.rows['600001']['score'])
+        self.assertEqual(result['anomalies'][0]['code'], '600002')
+        result = self.tick(engine, changed[:1], 4)
+        missing = next(r for r in result['anomalies'] if r['code'] == '600002')
+        self.assertTrue(missing['quote_missing'])
+        self.assertEqual(missing['age_seconds'], 2)
+        # Only one fresh bearish candidate remains; a missing stale row must
+        # not remain in the fresh cross-sectional population.
+        alone = Engine(Settings())
+        self.tick(alone, seeds[:1], 0)
+        self.tick(alone, changed[:1], 2)
+        self.tick(alone, changed[:1], 4)
+        self.assertEqual(engine.rows['600001']['score'], alone.rows['600001']['score'])
+
+
 class LiveLoopChecks(unittest.IsolatedAsyncioTestCase):
     async def test_ws_cancellation_during_accept(self):
         monitor = main.Monitor(None, Settings())

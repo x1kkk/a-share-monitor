@@ -13,6 +13,7 @@ from contextlib import asynccontextmanager
 from dataclasses import asdict
 from datetime import datetime
 from pathlib import Path
+from typing import Literal
 
 import httpx
 from fastapi import FastAPI, Header, HTTPException, Request, WebSocket, WebSocketDisconnect
@@ -20,11 +21,11 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, ConfigDict, Field
 
-from config import HEADERS, SHANGHAI, Settings, settings
+from config import HEADERS, SHANGHAI, FilterSettings, Settings, settings
 from engine import Engine
 from fetcher import Fetcher, Simulator, demo_seed, eligible, limit_price
 from notifier import Notifier
-from pre_market import MarketCalendar
+from pre_market import MarketCalendar, save_json
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s | %(message)s")
 # httpx request logs contain complete URLs, including a robot webhook's secret key.
@@ -34,7 +35,8 @@ log = logging.getLogger(__name__)
 
 
 class Monitor:
-    def __init__(self, client: httpx.AsyncClient, cfg: Settings, *, watchlist_path: Path | None = None):
+    def __init__(self, client: httpx.AsyncClient, cfg: Settings, *, watchlist_path: Path | None = None,
+                 filters_path: Path | None = None):
         self.cfg = cfg
         self.fetcher = Fetcher(client, cfg)
         self.calendar = MarketCalendar()
@@ -50,6 +52,17 @@ class Monitor:
         self.snapshot = {"type": "snapshot", "status": "initializing", "events": [],
                          "anomalies": [], "leaders": [], "stock_count": 0}
         self.watchlist_path = watchlist_path or Path(__file__).resolve().parent / "watchlist.json"
+        self.filters_path = filters_path or self.watchlist_path.parent / "monitor_filters.json"
+        try:
+            persisted = json.loads(self.filters_path.read_text(encoding="utf-8"))
+            if not isinstance(persisted, dict) or set(persisted) != set(asdict(FilterSettings())):
+                raise ValueError("invalid monitor_filters.json; refusing to overwrite")
+            filters = FilterSettings(**persisted)
+        except FileNotFoundError:
+            filters = FilterSettings()
+        for engine in self.engines.values():
+            engine.filters = filters
+        self.snapshot.update(self.engines["live"].configuration())
         try:
             codes = json.loads(self.watchlist_path.read_text(encoding="utf-8"))
             if not isinstance(codes, list) or any(not isinstance(c, str) or not re.fullmatch(r"(?:00|60)[0-9]{4}", c) for c in codes):
@@ -85,6 +98,7 @@ class Monitor:
                 engine.watchlist_events.pop(code, None)
                 engine.watchlist_kinds.pop(code, None)
                 engine.watchlist_condition.pop(code, None)
+                engine.watchlist_signals.pop(code, None)
             engine.watchlist = set(codes)
             for row in engine.rows.values():
                 row["is_watchlist"] = row["code"] in codes
@@ -93,6 +107,17 @@ class Monitor:
             engine.rows[initial["code"]] = initial
         self.broadcast({**self.snapshot, "events": [], "watchlist_leaders": engine.watchlist_rows(),
                         "watchlist_anomalies": engine.watchlist_board()})
+
+    def save_filters(self, filters: dict) -> None:
+        validated = FilterSettings(**filters)
+        # Reuse the fsync + same-directory atomic replace used by market caches.
+        # Persist first; a failed write must leave both engines and snapshot intact.
+        save_json(self.filters_path, asdict(validated))
+        for engine in self.engines.values():
+            engine.set_filters(asdict(validated))
+        engine = self.engines.get(self.mode, self.engines["live"])
+        self.broadcast({**self.snapshot, **engine.configuration(), "events": [],
+                        "anomalies": engine.anomaly_board(), "watchlist_anomalies": engine.watchlist_board()})
 
     def eligible_stocks(self):
         # Validate against real metadata, never synthetic simulation seed dates.
@@ -315,10 +340,12 @@ async def add_watchlist(body: WatchlistStock, request: Request, authorization: s
             raise HTTPException(status_code=422, detail="股票不存在、非成熟主板股票或真实行情/交易日历尚不可用")
         stock = stocks[body.code]
         initial = {**asdict(stock), "listed": stock.listed.isoformat() if stock.listed else None,
+                   "observed_since": stock.observed_since.isoformat() if stock.observed_since else None,
                    "quote_missing": True, "is_watchlist": True, "simulated": False}
         if monitor.mode == "mock" and monitor.simulator and body.code in monitor.simulator.current:
             quote = monitor.simulator.current[body.code]
             initial.update(asdict(quote), listed=quote.listed.isoformat() if quote.listed else None,
+                           observed_since=quote.observed_since.isoformat() if quote.observed_since else None,
                            simulated=True)
         try:
             monitor.save_watchlist(engine.watchlist | {body.code}, initial)
@@ -345,6 +372,31 @@ class Weights(BaseModel):
     turnover: float = Field(ge=0, le=100, allow_inf_nan=False)
     large_inflow: float = Field(ge=0, le=100, allow_inf_nan=False)
     amount: float = Field(ge=0, le=100, allow_inf_nan=False)
+
+
+class Filters(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+    sensitivity: Literal["conservative", "balanced", "sensitive"]
+    exclude_st: bool
+    exclude_low_amount: bool
+    min_daily_amount: int = Field(default=100_000_000, ge=0, le=1_000_000_000_000)
+
+
+@app.get("/api/filters")
+async def get_filters(request: Request, authorization: str | None = Header(default=None)):
+    monitor = watchlist_access(request, authorization)
+    return monitor.engines["live"].configuration()
+
+
+@app.put("/api/filters")
+async def put_filters(body: Filters, request: Request, authorization: str | None = Header(default=None)):
+    authorize(authorization)
+    monitor = watchlist_access(request, authorization)
+    try:
+        monitor.save_filters(body.model_dump())
+    except OSError as exc:
+        raise HTTPException(status_code=503, detail="过滤设置保存失败，请重试") from exc
+    return monitor.engines["live"].configuration()
 
 
 @app.put("/api/weights")
