@@ -209,6 +209,7 @@ onBeforeUnmount(() => {
 <template>
   <a href="#boards" class="skip-link">跳至行情榜单</a>
   <div class="terminal">
+    <p class="investment-warning"><span>投资有风险</span> <span>炒股需谨慎</span></p>
     <header class="console">
       <div class="brand-row">
         <div class="brand"><svg viewBox="0 0 32 32" aria-hidden="true"><path d="M5 23V9m7 18V5m7 15V10m7 15V6"/><path d="m3 19 8-7 8 3 10-9"/></svg><div><span class="eyebrow">A-SHARE MONITOR</span><h1>主板雷达<span class="brand-divider">/</span><span class="brand-sub">实时盯盘终端</span></h1></div></div>
