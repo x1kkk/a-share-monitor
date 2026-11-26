@@ -77,6 +77,38 @@ $env:CORS_ORIGINS = 'http://127.0.0.1:8000,http://localhost:5173,https://monitor
 
 模拟验收：显式设置 `MOCK_MODE=true`，构建前端并以单 worker 启动，打开页面点击开启声音、展开异动设置。均衡档约前 30 秒出现红色拉升及绿色跳水卡，随后首次封板/炸板；约 160 秒还会出现量比已就绪的跳水场景，整体约 8 分钟循环。观察原因、`--` 冷启动量比、方向筛选和设置保存；自选需真实元数据与交易日历准备好后添加，模拟种子不能用来伪造新增自选资格。
 
+## 二期升级：五档盘口与个股轨迹
+
+腾讯同轮快照新增 `Book.bids/asks`（元、手），空的价量档位忽略，`bid_levels` 保留过滤前的真实买档序号；`Quote.outer_vol/inner_vol` 为累计手数，缺失为 null。原 `Book` 前四个位置参数不变。实盘复用已解析盘口，不为全市场另发盘口请求。
+
+- `large_order_support`：买一至买五中某档金额至少 **1000 万元**，手数至少为其余有效买档均量的 **5 倍**（至少存在一个其他有效档），同一两位小数价位连续 **30 秒**满足才触发。使用单调时钟；撤单、跌破门槛、缺盘口/报价、切源、量额/内外盘计数回退或断流超过 10 秒重置。已涨停及涨停价买单不算托底，同一连续条件不重复触发。
+- `suspected_active_buy` / `suspected_large_smash`：相邻快照间隔 `0 < dt <= 6秒`，成交额增量至少 **500 万元**，相对上一帧价格上冲至少 **0.3%** / 回落至少 **0.3%**，外盘 / 内盘增量超过另一侧 **1.5 倍**。内外盘缺失时使用主力资金净额增量正负降级并明示；首帧和异常重置只建立基线。分别排除已涨停 / 已跌停，始终带 `signal_estimated=true`、`疑似` 和 `快照估算`，不代表逐笔或十档数据。
+- 新盘口信号普通声音 level 1，自选 level 2；一期双向异动保持普通 level 2、自选 level 3，首次封板/炸板 level 3。多空评分与额度独立；同方向卡片出现新种类时追加轨迹、更新触发说明，不重复占额度或延长普通卡片 TTL；同轮多个信号均记录。
+
+股票行新增 `outer_vol`、`inner_vol`、`outer_inner_ratio`，后者在计数完整且内盘大于零时取两位小数，否则 null。信号新增 `signal_estimated`、`support_info`（档位 `level`、价格 `price`、金额元 `amount`、持续秒数 `duration_seconds`）与 `summary`。`timeline` 为倒序最近 8 条，每股内存最多 12 条，包含 `time/direction/signal_type/signal_label/price/change_pct/summary/is_estimated`；跨交易日或清理引擎窗口时清空，临时缺报价保留历史。
+
+过滤接口和 `monitor_filters.json` 新增：
+
+```json
+{"enable_orderbook_signals":true,"support_min_amount_wan":1000.0,"burst_min_amount_wan":500.0}
+```
+
+金额单位万元，必须为有限数字且 `0 < value <= 1000000`。一期四字段配置自动补默认值；旧 PUT 不带新字段时保留现值。关闭盘口信号会清理对应基线和计时器，仍展示内外盘比和已有轨迹。页面“异动设置”可保存这些参数，卡片底部“异动轨迹”默认折叠；估算微标提供口径说明。
+
+**ST 口径按交易日处理**：历史主板 ST/`*ST` 在 2026-07-06 前为 ±5%；此日起按现行 ±10%。`config.stock_limit_prices()` 统一封板、跌停和盘口排除口径，价格按分四舍五入。依据：[上交所 2026 交易规则](https://www.sse.com.cn/lawandrules/sselawsrules2025/stocks/exchange/c/c_20260424_10816482.shtml)、[深交所 2026 交易规则](https://docs.static.szse.cn/www/lawrules/rule/trade/current/W020260424690713155663.pdf)。不能将当前 ST 固定按旧 5% 计算。
+
+模拟验收：设置 `MOCK_MODE=true`，使用默认均衡档和默认盘口门槛，重新启动单 worker，从首轮模拟行情计时（调度可能偏移约一轮 2 秒）：
+
+| 时间 | 股票 | 预期 |
+| --- | --- | --- |
+| 30 秒 | 002594 比亚迪 | 买二约 1200 万持续托底，普通提示一级 |
+| 40 秒 | 002594 | 疑似盘口扫货，估算微标，轨迹增至 2 条 |
+| 44 秒 | 003816 中国广核 | 疑似大单砸盘，绿色卡与估算微标 |
+| 48 秒 | 003816 | 放量跳水，轨迹增至 2 条 |
+| 52 秒 | 002594 | 急速拉升，同卡轨迹增至 3 条，普通提示二级 |
+
+展开轨迹应按最近在前展示；同期涨停股票卖档为空且不产生托底。约 480 秒循环，新周期重建基线。改灵敏度、金额门槛或噪音过滤后，触发时点可能变化；自选需先有真实元数据和交易日历才可添加。`test_data_sources.SourceBoundaryChecks.test_simulator_engine_emits_exact_orderbook_timeline` 无等待地验证以上完整时序。
+
 ## 香港静态前端 + 大陆后端
 
 1. 在构建机执行 `cd frontend && npm ci && npm run build`，将 `frontend/dist/` 内容复制到香港 Nginx 的 `/var/www/market-monitor/frontend/dist/`。

@@ -22,9 +22,9 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, ConfigDict, Field
 
-from config import HEADERS, SHANGHAI, FilterSettings, Settings, settings
+from config import HEADERS, SHANGHAI, FilterSettings, Settings, settings, stock_limit_prices
 from engine import Engine
-from fetcher import Fetcher, Simulator, demo_seed, eligible, limit_price
+from fetcher import Fetcher, Simulator, demo_seed, eligible
 from closing import SnapshotStore, close_target
 from notifier import Notifier
 from pre_market import MarketCalendar, save_json
@@ -55,7 +55,9 @@ class Monitor:
         self.filters_path = filters_path or self.watchlist_path.parent / "monitor_filters.json"
         try:
             persisted = json.loads(self.filters_path.read_text(encoding="utf-8"))
-            if not isinstance(persisted, dict) or set(persisted) != set(asdict(FilterSettings())):
+            required = {"sensitivity", "exclude_st", "exclude_low_amount", "min_daily_amount"}
+            if (not isinstance(persisted, dict) or not required <= set(persisted)
+                    or not set(persisted) <= set(asdict(FilterSettings()))):
                 raise ValueError("invalid monitor_filters.json; refusing to overwrite")
             filters = FilterSettings(**persisted)
         except FileNotFoundError:
@@ -280,9 +282,10 @@ class Monitor:
                         # time. Quiet/auction stocks must survive a successful fetch.
                         if not quotes:
                             raise ValueError("no eligible quotes: check calendar and listing dates")
-                        book_codes = self.engines["live"].touched_codes | {
-                            q.code for q in quotes if q.price >= limit_price(q.pre_close)
-                            or q.high >= limit_price(q.pre_close)}
+                        book_codes = {q.code for q in quotes} if self.engines["live"].filters.enable_orderbook_signals else (
+                            self.engines["live"].touched_codes | {
+                                q.code for q in quotes if q.price >= stock_limit_prices(q.pre_close, q.name, now.date())[0]
+                                or q.high >= stock_limit_prices(q.pre_close, q.name, now.date())[0]})
                         books = await self.fetcher.fetch_books(book_codes, datetime.now(SHANGHAI))
                         source = self.fetcher.source
                     if mode in {'live', 'mock'}:
@@ -468,6 +471,9 @@ class Filters(BaseModel):
     exclude_st: bool
     exclude_low_amount: bool
     min_daily_amount: int = Field(default=100_000_000, ge=0, le=1_000_000_000_000)
+    enable_orderbook_signals: bool = True
+    support_min_amount_wan: float = Field(default=1000.0, gt=0, le=1_000_000, allow_inf_nan=False)
+    burst_min_amount_wan: float = Field(default=500.0, gt=0, le=1_000_000, allow_inf_nan=False)
 
 
 @app.get("/api/filters")
@@ -481,7 +487,8 @@ async def put_filters(body: Filters, request: Request, authorization: str | None
     authorize(authorization)
     monitor = watchlist_access(request, authorization)
     try:
-        monitor.save_filters(body.model_dump())
+        current = asdict(monitor.engines["live"].filters)
+        monitor.save_filters({**current, **body.model_dump(exclude_unset=True)})
     except OSError as exc:
         raise HTTPException(status_code=503, detail="过滤设置保存失败，请重试") from exc
     return monitor.engines["live"].configuration()

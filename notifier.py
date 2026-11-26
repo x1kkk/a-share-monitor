@@ -12,7 +12,9 @@ import httpx
 from config import Settings
 
 log = logging.getLogger(__name__)
-EVENT_NAMES = {"anomaly": "实时异动", "limit_up": "首次封板", "break_open": "炸板告警"}
+EVENT_NAMES = {"anomaly": "实时异动", "limit_up": "首次封板", "break_open": "炸板告警",
+               "large_order_support": "大单托底", "suspected_active_buy": "疑似盘口扫货",
+               "suspected_large_smash": "疑似大单砸盘"}
 
 
 class Notifier:
@@ -62,6 +64,8 @@ class Notifier:
         if event.get("is_watchlist"):
             mode += " ★自选VIP"
         label = event.get("signal_label") or EVENT_NAMES[event["event_type"]]
+        if event.get("signal_estimated") is True:
+            label += "(快照估算)"
         direction = {"bullish": "多头机会", "bearish": "空头警报"}.get(event.get("direction"))
         if direction:
             mode += " " + direction
