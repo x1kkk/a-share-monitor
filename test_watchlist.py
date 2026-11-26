@@ -11,7 +11,7 @@ from unittest.mock import patch
 from fastapi.testclient import TestClient
 
 import main
-from config import SHANGHAI, Settings
+from config import SHANGHAI, FilterSettings, Settings
 from engine import Engine
 from fetcher import demo_seed, limit_price
 from notifier import Notifier
@@ -336,6 +336,111 @@ class FilterUpgradeChecks(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     main.Monitor(None, Settings(), watchlist_path=folder / 'watchlist.json', filters_path=path)
                 self.assertEqual(path.read_text(), invalid)
+
+
+class OrderbookFilterChecks(unittest.TestCase):
+    def test_phase_one_file_migrates_defaults_without_overwriting_original(self):
+        old={'sensitivity':'sensitive','exclude_st':True,'exclude_low_amount':False,
+             'min_daily_amount':100_000_000}
+        with tempfile.TemporaryDirectory() as directory:
+            folder=Path(directory)
+            path=folder/'monitor_filters.json'
+            content=json.dumps(old)
+            path.write_text(content,encoding='utf-8')
+            monitor=main.Monitor(None,replace(Settings(),wechat_webhook_url=''),
+                                 watchlist_path=folder/'watchlist.json',filters_path=path)
+            filters=monitor.snapshot['filters']
+            self.assertEqual(filters['sensitivity'],'sensitive')
+            self.assertTrue(filters['enable_orderbook_signals'])
+            self.assertEqual(filters['support_min_amount_wan'],1000)
+            self.assertEqual(filters['burst_min_amount_wan'],500)
+            for engine in monitor.engines.values():
+                self.assertEqual(engine.configuration()['filters'],filters)
+            self.assertEqual(path.read_text(encoding='utf-8'),content)
+
+    def test_new_filter_fields_validate_finite_positive_numbers_and_strict_booleans(self):
+        for invalid in ({'enable_orderbook_signals':'true'},
+                        {'support_min_amount_wan':True},
+                        {'support_min_amount_wan':0},
+                        {'support_min_amount_wan':-1},
+                        {'support_min_amount_wan':float('inf')},
+                        {'burst_min_amount_wan':float('nan')},
+                        {'burst_min_amount_wan':1_000_001}):
+            with self.subTest(invalid=invalid):
+                with self.assertRaises((ValueError,TypeError)):
+                    FilterSettings(**invalid)
+        valid=FilterSettings(enable_orderbook_signals=False,support_min_amount_wan=1200.5,
+                             burst_min_amount_wan=600)
+        self.assertEqual(valid.snapshot()['support_min_amount_wan'],1200.5)
+        self.assertFalse(valid.snapshot()['enable_orderbook_signals'])
+
+    def test_phase_two_filter_api_persists_both_engines_and_legacy_put_preserves_new_values(self):
+        cfg=replace(Settings(),api_token='phase-two-test',wechat_webhook_url='')
+        old={'sensitivity':'balanced','exclude_st':False,'exclude_low_amount':False}
+        body={**old,'enable_orderbook_signals':False,'support_min_amount_wan':1250.0,
+              'burst_min_amount_wan':650.5}
+        with tempfile.TemporaryDirectory() as directory:
+            folder=Path(directory)
+            path=folder/'monitor_filters.json'
+            monitor=main.Monitor(None,cfg,watchlist_path=folder/'watchlist.json',filters_path=path)
+            @asynccontextmanager
+            async def lifespan(app):
+                app.state.monitor=monitor
+                yield
+            with patch.object(main,'settings',cfg),patch.object(main.app.router,'lifespan_context',lifespan):
+                with TestClient(main.app) as client:
+                    headers={'authorization':'Bearer '+cfg.api_token,'origin':'http://localhost:5173'}
+                    self.assertEqual(client.put('/api/filters',json=body).status_code,401)
+                    self.assertEqual(client.put('/api/filters',headers={**headers,'origin':'https://invalid.example'},json=body).status_code,403)
+                    for invalid in ({**body,'enable_orderbook_signals':1},
+                                    {**body,'support_min_amount_wan':0},
+                                    {**body,'support_min_amount_wan':'1000'},
+                                    {**body,'burst_min_amount_wan':False},
+                                    {**body,'burst_min_amount_wan':1_000_001}):
+                        self.assertEqual(client.put('/api/filters',headers=headers,json=invalid).status_code,422)
+                    response=client.put('/api/filters',headers=headers,json=body)
+                    self.assertEqual(response.status_code,200)
+                    saved=response.json()['filters']
+                    self.assertFalse(saved['enable_orderbook_signals'])
+                    self.assertEqual(saved['support_min_amount_wan'],1250)
+                    self.assertEqual(saved['burst_min_amount_wan'],650.5)
+                    for engine in monitor.engines.values():
+                        self.assertEqual(engine.configuration()['filters'],saved)
+                    # An old phase-one client must not silently turn the new
+                    # orderbook switch back on or reset customized thresholds.
+                    response=client.put('/api/filters',headers=headers,json={**old,'sensitivity':'sensitive'})
+                    self.assertEqual(response.status_code,200)
+                    retained=response.json()['filters']
+                    for key in ('enable_orderbook_signals','support_min_amount_wan','burst_min_amount_wan'):
+                        self.assertEqual(retained[key],saved[key])
+                    before=path.read_bytes()
+                    for target in ('main.os.fsync','main.os.replace'):
+                        with patch(target,side_effect=OSError('write failed')):
+                            response=client.put('/api/filters',headers=headers,json={**body,'enable_orderbook_signals':True})
+                        self.assertEqual(response.status_code,503)
+                        self.assertEqual(path.read_bytes(),before)
+                        for engine in monitor.engines.values():
+                            self.assertEqual(engine.configuration()['filters'],retained)
+                    restored=main.Monitor(None,cfg,watchlist_path=folder/'watchlist.json',filters_path=path)
+                    self.assertEqual(restored.snapshot['filters'],retained)
+
+    def test_phase_two_wechat_keeps_estimate_disclosure_and_signal_cooldown(self):
+        notifier=Notifier(None,replace(Settings(),wechat_webhook_url=''))
+        base={'code':'600000','name':'测试股票','event_type':'anomaly',
+              'time':'2026-11-26T10:00:00+08:00','price':10.04,'pct':.4,
+              'simulated':False,'direction':'bullish','alert_level':1}
+        support={**base,'signal_type':'large_order_support','signal_label':'大单托底',
+                 'signal_estimated':False,'reason':'10:00:00 触发【大单托底】，买二挂单1500万，已连续托底30秒'}
+        sweep={**base,'signal_type':'suspected_active_buy','signal_label':'疑似盘口扫货',
+               'signal_estimated':True,'reason':'10:00:02 触发【疑似盘口扫货】(快照估算)，2秒成交额突增600万，外盘占优'}
+        accepted=notifier.publish([support,sweep],clock=0)
+        self.assertEqual(len(accepted),2)
+        text=notifier.markdown(accepted[1])
+        self.assertIn('疑似盘口扫货',text)
+        self.assertIn('快照估算',text)
+        self.assertIn('2秒成交额突增600万',text)
+        self.assertIn('快照估算',notifier.markdown({**accepted[1],'reason':'2秒成交额突增600万，外盘占优'}))
+        self.assertEqual(notifier.publish([sweep],clock=2),[])
 
 
 if __name__ == '__main__':
