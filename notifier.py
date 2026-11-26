@@ -35,7 +35,7 @@ class Notifier:
         for raw in sorted(events, key=lambda event: not event.get("is_watchlist", False)):
             # Simulation never consumes the live-event cooldown budget.
             code = ("mock:" if raw["simulated"] else "live:") + raw["code"]
-            key = (code, raw["event_type"])
+            key = (code, raw.get("signal_type") or raw["event_type"])
             if key in self.last_notify_time and not raw.get("is_watchlist"):
                 self.suppressed += 1
                 log.info("冷却抑制 %s %s %s", raw["code"], raw["name"], EVENT_NAMES[raw["event_type"]])
@@ -61,11 +61,17 @@ class Notifier:
         mode = "模拟演练" if event["simulated"] else "实盘监控"
         if event.get("is_watchlist"):
             mode += " ★自选VIP"
-        content = (f"### 【{mode}】{EVENT_NAMES[event['event_type']]}\n"
+        label = event.get("signal_label") or EVENT_NAMES[event["event_type"]]
+        direction = {"bullish": "多头机会", "bearish": "空头警报"}.get(event.get("direction"))
+        if direction:
+            mode += " " + direction
+        content = (f"### 【{mode}】{label}\n"
                    f"**{name} ({event['code']})**\n"
                    f"> 价格：{event['price']:.2f}　涨幅：{event['pct']:.2f}%\n"
                    f"> 时间：{event['time']}\n")
-        if "speed_2m" in event:
+        if event.get("reason"):
+            content += f"> {event['reason']}\n"
+        elif "speed_2m" in event:
             content += f"> 两分钟涨速：{event['speed_2m']:.2f}%　强度：{event['score']:.2f}\n"
         if "break_count" in event:
             content += f"> 今日开板次数：{event['break_count']}\n"

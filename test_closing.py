@@ -99,11 +99,11 @@ class ClosingChecks(unittest.IsolatedAsyncioTestCase):
             store.path.write_text('{broken')
             self.assertIsNone(store.load())
 
-    async def test_mock_setting_cannot_enable_simulated_production_polling(self):
+    async def test_production_configuration_keeps_real_polling(self):
         now = datetime(2026, 11, 18, 10, tzinfo=SHANGHAI)
         quote = replace(demo_seed()[0], source_ts=now.timestamp())
         with tempfile.TemporaryDirectory() as directory:
-            cfg = replace(Settings(), mock_mode=True, poll_seconds=0.01, wechat_webhook_url='')
+            cfg = replace(Settings(), mock_mode=False, poll_seconds=0.01, wechat_webhook_url='')
             monitor = main.Monitor(None, cfg, watchlist_path=Path(directory) / 'watchlist.json')
             monitor.initialize = AsyncMock()
             monitor.calendar = calendar(now.date())
@@ -121,6 +121,53 @@ class ClosingChecks(unittest.IsolatedAsyncioTestCase):
                 finally:
                     task.cancel()
                     await asyncio.gather(task, return_exceptions=True)
+
+
+    async def test_explicit_mock_is_isolated_and_does_not_overwrite_real_snapshot(self):
+        now = datetime(2026, 11, 18, 10, tzinfo=SHANGHAI)
+        with tempfile.TemporaryDirectory() as directory:
+            cfg = replace(Settings(), mock_mode=True, poll_seconds=0.01, wechat_webhook_url='')
+            monitor = main.Monitor(None, cfg, watchlist_path=Path(directory) / 'watchlist.json')
+            monitor.initialize = AsyncMock()
+            monitor.calendar = calendar(now.date())
+            monitor.fetcher.fetch_market = AsyncMock(side_effect=AssertionError('mock must not poll live'))
+            monitor.snapshot_store.save = Mock(side_effect=AssertionError('mock must never persist as real'))
+            queue = asyncio.Queue()
+            monitor.clients.add(queue)
+            with patch('main.datetime') as clock:
+                clock.now.return_value = now
+                task = asyncio.create_task(monitor.poll())
+                try:
+                    payload = await asyncio.wait_for(queue.get(), timeout=1)
+                    self.assertEqual(payload['mode'], 'mock')
+                    self.assertTrue(payload['simulated'])
+                    self.assertEqual(payload['filters']['sensitivity'], 'balanced')
+                    monitor.fetcher.fetch_market.assert_not_called()
+                    monitor.snapshot_store.save.assert_not_called()
+                finally:
+                    task.cancel()
+                    await asyncio.gather(task, return_exceptions=True)
+
+    async def test_closed_snapshot_uses_current_persisted_filters_and_ttl(self):
+        now = datetime(2026, 11, 18, 15, 1, tzinfo=SHANGHAI)
+        quote = replace(demo_seed()[0], source_ts=now.replace(minute=0).timestamp())
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'watchlist.json'
+            monitor = main.Monitor(None, Settings(), watchlist_path=path)
+            monitor.calendar = calendar(now.date())
+            monitor.fetcher.fetch_market = AsyncMock(return_value=[quote])
+            monitor.fetcher.fetch_books = AsyncMock(return_value={})
+            await monitor.show_closed(now)
+            monitor.save_filters({'sensitivity': 'sensitive', 'exclude_st': True})
+            await monitor.show_closed(now)
+            self.assertEqual(monitor.snapshot['filters']['sensitivity'], 'sensitive')
+            self.assertTrue(monitor.snapshot['filters']['exclude_st'])
+            self.assertEqual(monitor.snapshot['ttl']['watchlist']['remove_seconds'], 300)
+            restored = main.Monitor(None, Settings(), watchlist_path=path)
+            restored.calendar = calendar(now.date())
+            await restored.show_closed(now)
+            self.assertEqual(restored.snapshot['filters']['sensitivity'], 'sensitive')
+            self.assertFalse(restored.snapshot['simulated'])
 
 
 if __name__ == '__main__':

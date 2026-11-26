@@ -28,8 +28,9 @@ def number(value: object, default: float = 0.0) -> float:
         return default
 
 
-def limit_price(pre_close: float) -> float:
-    return float((Decimal(str(pre_close)) * Decimal("1.10")).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP))
+def limit_price(pre_close: float, *, rate: float = 0.10) -> float:
+    return float((Decimal(str(pre_close)) * (Decimal(1) + Decimal(str(rate)))).quantize(
+        Decimal("0.01"), rounding=ROUND_HALF_UP))
 
 
 @dataclass(frozen=True)
@@ -67,7 +68,7 @@ class Book:
 
 def parse_quote(row: dict, *, now: datetime | None = None) -> Quote | None:
     code, name = str(row.get("f12", "")), str(row.get("f14", "")).strip()
-    if not re.fullmatch(r"(?:60|00)\d{4}", code) or not name or "ST" in name.upper():
+    if not re.fullmatch(r"(?:60|00)\d{4}", code) or not name or "退" in name:
         return None
     snapshot_time = (now or datetime.now(SHANGHAI)).astimezone(SHANGHAI)
     minute = snapshot_time.hour * 60 + snapshot_time.minute
@@ -127,7 +128,7 @@ def parse_tencent(text: str, stocks: dict[str, dict]) -> tuple[dict[str, Quote],
         if len(fields) <= 44 or fields[2] != code:
             raise ValueError("truncated Tencent quote")
         name = fields[1].strip()
-        if "ST" in name.upper() or "退" in name:
+        if "退" in name:
             continue
         price, previous = (number(fields[i], -1) for i in (3, 4))
         if price == 0:  # Explicit suspended/untraded stock, not a missing response.
@@ -454,23 +455,35 @@ class Simulator:
         codes = list(self.base)
         self.cohort = self.rng.sample(codes, min(cfg.mock_cohort, len(codes)))
         self.sealed = set(self.cohort[:max(1, len(self.cohort) // 2)])
+        remaining = sorted(c for c in codes if c not in self.cohort)
+        self.plunging = set(remaining[:3])
+        self.warm_plunging = set(remaining[3:6])
 
     def step(self, now: datetime) -> tuple[list[Quote], dict[str, Book]]:
         self.tick += 1
         # First tick is the baseline. Then a random subset rises by 0.8%-2.5%.
         phase = self.tick % 240
-        stimulated = self.rng.sample(self.cohort, min(3, len(self.cohort))) if 2 <= phase <= 14 else []
+        stimulated = self.rng.sample(self.cohort, min(3, len(self.cohort))) if (
+            2 <= phase <= 14 or 90 <= phase <= 98) else []
         books = {}
         for code, base in self.base.items():
             old = self.current[code]
             ceiling = limit_price(base.pre_close)
             price, flow = old.price, old.main_inflow
-            if code in self.cohort and (self.tick == 1 or phase == 0):
+            resetting = (code in self.cohort or code in self.plunging or code in self.warm_plunging) and (
+                self.tick == 1 or phase == 0)
+            if resetting:
                 price = round(base.pre_close * 0.99, 2)
                 flow = 0.0
             elif code in stimulated:
                 price = min(round(price + base.pre_close * self.rng.uniform(0.008, 0.025), 2), ceiling - 0.01)
                 flow += self.rng.uniform(2e6, 12e6)
+            diving = ((code in self.plunging and 8 <= phase <= 13) or
+                      (code in self.warm_plunging and 80 <= phase <= 85))
+            if diving:
+                floor = limit_price(base.pre_close, rate=-0.10)
+                price = max(round(price - base.pre_close * 0.012, 2), floor + 0.01)
+                flow -= 6e6
             if code in self.sealed and 16 <= phase <= 20:
                 price = ceiling
                 flow += 8e6
@@ -481,9 +494,11 @@ class Simulator:
             elif code in self.sealed and phase == 31:
                 price = round(ceiling - base.pre_close * 0.02, 2)
             # Afterwards hold steady: unsealed anomalies can turn gray and disappear.
+            lots = 1200 if diving or code in stimulated else 100
             q = replace(base, price=price, pct=round((price / base.pre_close - 1) * 100, 4),
                         main_inflow=flow, super_inflow=flow * 0.6, large_inflow=flow * 0.4,
-                        amount=base.amount + self.tick * 1e5, volume=base.volume + self.tick * 100,
+                        amount=old.amount + price * lots * 100, volume=old.volume + lots,
+                        flow_epoch=old.flow_epoch + int(resetting),
                         high=max(old.high, price), source_ts=now.timestamp())
             self.current[code] = q
             books[code] = Book(price, self.rng.randint(1000, 30000) if price >= ceiling else 100,

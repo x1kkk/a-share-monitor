@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from datetime import timedelta, timezone
 
 SHANGHAI = timezone(timedelta(hours=8), name="Asia/Shanghai")
@@ -14,6 +14,32 @@ WECHAT_WEBHOOK_URL: str = ""
 def env_bool(name: str, default: bool) -> bool:
     value = os.getenv(name)
     return default if value is None else value.lower() in {"1", "true", "yes", "on"}
+
+
+SENSITIVITY_PRESETS = {
+    "conservative": {"rise_speed_threshold": 3.0, "plunge_speed_threshold": 3.0, "vol_ratio_threshold": 3.0},
+    "balanced": {"rise_speed_threshold": 2.0, "plunge_speed_threshold": 2.0, "vol_ratio_threshold": 2.0},
+    "sensitive": {"rise_speed_threshold": 1.0, "plunge_speed_threshold": 1.0, "vol_ratio_threshold": 1.5},
+}
+
+
+@dataclass(frozen=True)
+class FilterSettings:
+    sensitivity: str = "balanced"
+    exclude_st: bool = False
+    exclude_low_amount: bool = False
+    min_daily_amount: int = 100_000_000
+
+    def __post_init__(self):
+        if not isinstance(self.sensitivity, str) or self.sensitivity not in SENSITIVITY_PRESETS:
+            raise ValueError("unknown sensitivity")
+        if type(self.exclude_st) is not bool or type(self.exclude_low_amount) is not bool:
+            raise ValueError("filter switches must be booleans")
+        if type(self.min_daily_amount) is not int or not 0 <= self.min_daily_amount <= 1_000_000_000_000:
+            raise ValueError("min_daily_amount must be an integer in 0..1000000000000")
+
+    def snapshot(self) -> dict:
+        return {**asdict(self), **SENSITIVITY_PRESETS[self.sensitivity]}
 
 
 @dataclass(frozen=True)
@@ -38,6 +64,8 @@ class Settings:
     notify_cooldown: float = 300.0
     active_seconds: float = 120.0
     remove_seconds: float = 420.0
+    watchlist_active_seconds: float = 120.0
+    watchlist_remove_seconds: float = 300.0
     minimum_listing_sessions: int = 15
     max_new_per_minute: int = 10
     break_sell_lots: float = 10000.0

@@ -13,6 +13,7 @@ from contextlib import asynccontextmanager
 from dataclasses import asdict, replace
 from datetime import datetime
 from pathlib import Path
+from typing import Literal
 
 import httpx
 from fastapi import FastAPI, Header, HTTPException, Request, WebSocket, WebSocketDisconnect
@@ -21,12 +22,12 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, ConfigDict, Field
 
-from config import HEADERS, SHANGHAI, Settings, settings
+from config import HEADERS, SHANGHAI, FilterSettings, Settings, settings
 from engine import Engine
-from fetcher import Fetcher, eligible, limit_price
+from fetcher import Fetcher, Simulator, demo_seed, eligible, limit_price
 from closing import SnapshotStore, close_target
 from notifier import Notifier
-from pre_market import MarketCalendar
+from pre_market import MarketCalendar, save_json
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s | %(message)s")
 # httpx request logs contain complete URLs, including a robot webhook's secret key.
@@ -36,11 +37,12 @@ log = logging.getLogger(__name__)
 
 
 class Monitor:
-    def __init__(self, client: httpx.AsyncClient, cfg: Settings, *, watchlist_path: Path | None = None):
+    def __init__(self, client: httpx.AsyncClient, cfg: Settings, *, watchlist_path: Path | None = None,
+                 filters_path: Path | None = None):
         self.cfg = cfg
         self.fetcher = Fetcher(client, cfg)
         self.calendar = MarketCalendar()
-        # The mock engine remains only for legacy offline checks; production never selects it.
+        # Production defaults to real snapshots; only explicit MOCK_MODE=true selects simulation.
         self.engines = {"mock": Engine(cfg), "live": Engine(cfg)}
         self.notifier = Notifier(client, cfg)
         self.clients: set[asyncio.Queue] = set()
@@ -50,6 +52,17 @@ class Monitor:
         self.snapshot = {"type": "snapshot", "status": "initializing", "events": [],
                          "anomalies": [], "leaders": [], "stock_count": 0}
         self.watchlist_path = watchlist_path or Path(__file__).resolve().parent / "watchlist.json"
+        self.filters_path = filters_path or self.watchlist_path.parent / "monitor_filters.json"
+        try:
+            persisted = json.loads(self.filters_path.read_text(encoding="utf-8"))
+            if not isinstance(persisted, dict) or set(persisted) != set(asdict(FilterSettings())):
+                raise ValueError("invalid monitor_filters.json; refusing to overwrite")
+            filters = FilterSettings(**persisted)
+        except FileNotFoundError:
+            filters = FilterSettings()
+        for engine in self.engines.values():
+            engine.filters = filters
+        self.snapshot.update(self.engines["live"].configuration())
         self.snapshot_store = SnapshotStore(self.watchlist_path.parent / 'market_snapshot.json')
         self.saved_snapshot = self.snapshot_store.load()
         self.snapshot_save_at = 0.0
@@ -89,6 +102,7 @@ class Monitor:
                 engine.watchlist_events.pop(code, None)
                 engine.watchlist_kinds.pop(code, None)
                 engine.watchlist_condition.pop(code, None)
+                engine.watchlist_signals.pop(code, None)
             engine.watchlist = set(codes)
             for row in engine.rows.values():
                 row["is_watchlist"] = row["code"] in codes
@@ -97,6 +111,17 @@ class Monitor:
             engine.rows[initial["code"]] = initial
         self.broadcast({**self.snapshot, "events": [], "watchlist_leaders": engine.watchlist_rows(),
                         "watchlist_anomalies": engine.watchlist_board()})
+
+    def save_filters(self, filters: dict) -> None:
+        validated = FilterSettings(**filters)
+        # Reuse the fsync + same-directory atomic replace used by market caches.
+        # Persist first; a failed write must leave both engines and snapshot intact.
+        save_json(self.filters_path, asdict(validated))
+        for engine in self.engines.values():
+            engine.set_filters(asdict(validated))
+        engine = self.engines.get(self.mode, self.engines["live"])
+        self.broadcast({**self.snapshot, **engine.configuration(), "events": [],
+                        "anomalies": engine.anomaly_board(), "watchlist_anomalies": engine.watchlist_board()})
 
     def eligible_stocks(self):
         # Validate against real metadata, never synthetic simulation seed dates.
@@ -113,7 +138,8 @@ class Monitor:
 
     def broadcast(self, snapshot: dict) -> None:
         self.sequence += 1
-        self.snapshot = jsonable_encoder({**snapshot, "sequence": self.sequence})
+        engine = self.engines.get(self.mode, self.engines["live"])
+        self.snapshot = jsonable_encoder({**snapshot, **engine.configuration(), "sequence": self.sequence})
         for queue in tuple(self.clients):
             # Disconnect slow consumers rather than silently losing alert events.
             if queue.full():
@@ -137,6 +163,15 @@ class Monitor:
             except (httpx.HTTPError, TimeoutError, ValueError) as exc:
                 log.warning("真实行情不可用：%s；仅保留已验证历史快照，不生成模拟数据", type(exc).__name__)
         self.calendar_retry_at = time.monotonic() + 300
+
+    def make_simulator(self, now: datetime) -> None:
+        seeds = eligible(self.fetcher.last_raw, self.calendar, now.date(), self.cfg)
+        source = "real_static_snapshot"
+        if not seeds:
+            seeds, source = demo_seed(), "synthetic_demo_snapshot"
+        self.simulator = Simulator(seeds, self.cfg, source)
+        self.simulator_day = now.date()
+        log.warning("进入模拟：种子来源=%s 数量=%d；模拟微信=%s", source, len(seeds), self.cfg.mock_wechat)
 
     def persist_snapshot(self, result):
         clean = jsonable_encoder(result)
@@ -222,8 +257,8 @@ class Monitor:
                         and (self.calendar_task is None or self.calendar_task.done())):
                     self.calendar_retry_at = started + 300
                     self.calendar_task = asyncio.create_task(self.calendar.load(self.cfg, now.date()))
-                mode = "closed" if self.session == "closed" else "live"
-                if self.session == "calendar_unavailable":
+                mode = "mock" if self.cfg.mock_mode else "closed" if self.session == "closed" else "live"
+                if self.session == "calendar_unavailable" and not self.cfg.mock_mode:
                     mode = "blocked"
                 if mode != self.mode:
                     self.engines["live"].clear_windows()
@@ -233,6 +268,11 @@ class Monitor:
                         raise ValueError("calendar unavailable: live market filtering is blocked")
                     if mode == 'closed':
                         await self.show_closed(now)
+                    elif mode == 'mock':
+                        if getattr(self, 'simulator', None) is None or self.simulator_day != now.date():
+                            self.make_simulator(now)
+                        quotes, books = self.simulator.step(now)
+                        source = self.simulator.source
                     else:
                         raw = await self.fetcher.fetch_market()
                         quotes = eligible(raw, self.calendar, now.date(), self.cfg, current_session=True)
@@ -245,10 +285,10 @@ class Monitor:
                             or q.high >= limit_price(q.pre_close)}
                         books = await self.fetcher.fetch_books(book_codes, datetime.now(SHANGHAI))
                         source = self.fetcher.source
-                    if mode == 'live':
+                    if mode in {'live', 'mock'}:
                         now = datetime.now(SHANGHAI)
                         engine = self.engines[mode]
-                        result = engine.update(quotes, books, now, simulated=False,
+                        result = engine.update(quotes, books, now, simulated=mode == "mock",
                                            yesterday_streaks=self.calendar.yesterday_streaks
                                            if self.calendar.streaks_ready and mode == "live" else None)
                         result["events"] = self.notifier.publish(result["events"])
@@ -258,7 +298,8 @@ class Monitor:
                                    "session": self.session, "cycle_ms": round(elapsed * 1000, 1),
                                    "calendar_error": self.calendar.error, "poll_seconds": self.cfg.poll_seconds})
                         self.last_success_clock = time.monotonic()
-                        self.persist_snapshot(result)
+                        if mode == "live":
+                            self.persist_snapshot(result)
                         self.broadcast(result)
                         log.info("轮询 #%d %s 股票=%d 异动=%d 封板=%d 告警=%d 耗时=%.0fms",
                              self.sequence, mode, len(quotes), len(result["anomalies"]),
@@ -387,7 +428,13 @@ async def add_watchlist(body: WatchlistStock, request: Request, authorization: s
             raise HTTPException(status_code=422, detail="股票不存在、非成熟主板股票或真实行情/交易日历尚不可用")
         stock = stocks[body.code]
         initial = {**asdict(stock), "listed": stock.listed.isoformat() if stock.listed else None,
+                   "observed_since": stock.observed_since.isoformat() if stock.observed_since else None,
                    "quote_missing": True, "is_watchlist": True, "simulated": False}
+        if monitor.mode == "mock" and getattr(monitor, "simulator", None) and body.code in monitor.simulator.current:
+            quote = monitor.simulator.current[body.code]
+            initial.update(asdict(quote), listed=quote.listed.isoformat() if quote.listed else None,
+                           observed_since=quote.observed_since.isoformat() if quote.observed_since else None,
+                           simulated=True)
         try:
             monitor.save_watchlist(engine.watchlist | {body.code}, initial)
         except OSError as exc:
@@ -413,6 +460,31 @@ class Weights(BaseModel):
     turnover: float = Field(ge=0, le=100, allow_inf_nan=False)
     large_inflow: float = Field(ge=0, le=100, allow_inf_nan=False)
     amount: float = Field(ge=0, le=100, allow_inf_nan=False)
+
+
+class Filters(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+    sensitivity: Literal["conservative", "balanced", "sensitive"]
+    exclude_st: bool
+    exclude_low_amount: bool
+    min_daily_amount: int = Field(default=100_000_000, ge=0, le=1_000_000_000_000)
+
+
+@app.get("/api/filters")
+async def get_filters(request: Request, authorization: str | None = Header(default=None)):
+    monitor = watchlist_access(request, authorization)
+    return monitor.engines["live"].configuration()
+
+
+@app.put("/api/filters")
+async def put_filters(body: Filters, request: Request, authorization: str | None = Header(default=None)):
+    authorize(authorization)
+    monitor = watchlist_access(request, authorization)
+    try:
+        monitor.save_filters(body.model_dump())
+    except OSError as exc:
+        raise HTTPException(status_code=503, detail="过滤设置保存失败，请重试") from exc
+    return monitor.engines["live"].configuration()
 
 
 @app.put("/api/weights")
