@@ -22,12 +22,13 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, ConfigDict, Field
 
-from config import HEADERS, SHANGHAI, FilterSettings, Settings, settings
+from config import HEADERS, SHANGHAI, FilterSettings, Settings, settings, stock_limit_prices
 from engine import Engine
-from fetcher import Fetcher, Simulator, demo_seed, eligible, limit_price
+from fetcher import Fetcher, Simulator, demo_seed, eligible
 from closing import SnapshotStore, close_target
 from notifier import Notifier
 from pre_market import MarketCalendar, save_json
+from review import ReviewService
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s | %(message)s")
 # httpx request logs contain complete URLs, including a robot webhook's secret key.
@@ -55,7 +56,9 @@ class Monitor:
         self.filters_path = filters_path or self.watchlist_path.parent / "monitor_filters.json"
         try:
             persisted = json.loads(self.filters_path.read_text(encoding="utf-8"))
-            if not isinstance(persisted, dict) or set(persisted) != set(asdict(FilterSettings())):
+            required = {"sensitivity", "exclude_st", "exclude_low_amount", "min_daily_amount"}
+            if (not isinstance(persisted, dict) or not required <= set(persisted)
+                    or not set(persisted) <= set(asdict(FilterSettings()))):
                 raise ValueError("invalid monitor_filters.json; refusing to overwrite")
             filters = FilterSettings(**persisted)
         except FileNotFoundError:
@@ -79,6 +82,8 @@ class Monitor:
         self.sequence = 0
         self.calendar_task: asyncio.Task | None = None
         self.calendar_retry_at = 0.0
+        cache_dir = self.watchlist_path.parent / "review_cache"
+        self.review = ReviewService(self, cache_dir / "mock" if cfg.mock_mode else cache_dir)
         if not self.watchlist_path.exists():
             self.save_watchlist(set(codes))
 
@@ -213,7 +218,9 @@ class Monitor:
                 if not quotes:
                     raise ValueError('no verified closing quotes')
                 books = await self.fetcher.fetch_books({q.code for q in quotes}, now)
-                result = self.engines['live'].update(quotes, books, target, simulated=False)
+                streaks = self.review.base_streaks(now, target.date())
+                result = self.engines['live'].update(quotes, books, target, simulated=False,
+                                                     yesterday_streaks=streaks)
                 result.update(status='closed', mode='closed', session='closed', source='tencent',
                               snapshot_kind='close', as_of=target.isoformat(), time=target.isoformat(),
                               captured_at=now.isoformat(), events=[], using_cached_snapshot=True,
@@ -280,17 +287,19 @@ class Monitor:
                         # time. Quiet/auction stocks must survive a successful fetch.
                         if not quotes:
                             raise ValueError("no eligible quotes: check calendar and listing dates")
-                        book_codes = self.engines["live"].touched_codes | {
-                            q.code for q in quotes if q.price >= limit_price(q.pre_close)
-                            or q.high >= limit_price(q.pre_close)}
+                        book_codes = {q.code for q in quotes} if self.engines["live"].filters.enable_orderbook_signals else (
+                            self.engines["live"].touched_codes | {
+                                q.code for q in quotes if q.price >= stock_limit_prices(q.pre_close, q.name, now.date())[0]
+                                or q.high >= stock_limit_prices(q.pre_close, q.name, now.date())[0]})
                         books = await self.fetcher.fetch_books(book_codes, datetime.now(SHANGHAI))
                         source = self.fetcher.source
                     if mode in {'live', 'mock'}:
                         now = datetime.now(SHANGHAI)
                         engine = self.engines[mode]
+                        streaks = self.review.inject_streaks(now)
                         result = engine.update(quotes, books, now, simulated=mode == "mock",
-                                           yesterday_streaks=self.calendar.yesterday_streaks
-                                           if self.calendar.streaks_ready and mode == "live" else None)
+                                               yesterday_streaks=streaks)
+                        self.review.capture_live(engine, now)
                         result["events"] = self.notifier.publish(result["events"])
                         elapsed = time.monotonic() - started
                         result.update({"status": "ok", "mode": mode, "source": source,
@@ -345,7 +354,7 @@ async def lifespan(app: FastAPI):
         monitor = Monitor(client, settings)
         app.state.monitor = monitor
         tasks = [asyncio.create_task(monitor.poll()), asyncio.create_task(monitor.notifier.worker()),
-                 asyncio.create_task(monitor.fetcher.sectors.run())]
+                 asyncio.create_task(monitor.fetcher.sectors.run()), asyncio.create_task(monitor.review.run())]
         try:
             yield
         finally:
@@ -388,6 +397,43 @@ async def snapshot(request: Request, authorization: str | None = Header(default=
     authorize(authorization)
     # REST refresh/reconnect is state synchronization, never historical sound replay.
     return {**request.app.state.monitor.snapshot, "events": []}
+
+
+@app.get("/api/review/meta")
+async def review_meta(request: Request, authorization: str | None = Header(default=None)):
+    authorize(authorization)
+    return request.app.state.monitor.review.meta()
+
+
+@app.get("/api/review/ladder")
+async def review_ladder(request: Request, mode: Literal["review", "live"] = "review",
+                        date: str | None = None, authorization: str | None = Header(default=None)):
+    authorize(authorization)
+    review = request.app.state.monitor.review
+    if date is not None and (not re.fullmatch(r"[0-9]{4}-[0-9]{2}-[0-9]{2}", date)
+                             or date not in review.meta()["dates"]):
+        raise HTTPException(status_code=422, detail="date must be one of the latest 15 completed sessions")
+    return review.ladder(mode, date)
+
+
+class ReviewRefresh(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    date: str | None = Field(default=None, pattern=r"^[0-9]{4}-[0-9]{2}-[0-9]{2}$")
+    lhb: bool = False
+
+
+@app.post("/api/review/refresh", status_code=202)
+async def review_refresh(body: ReviewRefresh, request: Request,
+                         authorization: str | None = Header(default=None)):
+    authorize(authorization)
+    review = request.app.state.monitor.review
+    try:
+        queued = review.queue_refresh(body.date or review.meta()["default_date"], body.lhb)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    if not queued:
+        raise HTTPException(status_code=429, detail="review refresh already pending or throttled (30 seconds)")
+    return {"status": "queued"}
 
 
 class WatchlistStock(BaseModel):
@@ -468,6 +514,9 @@ class Filters(BaseModel):
     exclude_st: bool
     exclude_low_amount: bool
     min_daily_amount: int = Field(default=100_000_000, ge=0, le=1_000_000_000_000)
+    enable_orderbook_signals: bool = True
+    support_min_amount_wan: float = Field(default=1000.0, gt=0, le=1_000_000, allow_inf_nan=False)
+    burst_min_amount_wan: float = Field(default=500.0, gt=0, le=1_000_000, allow_inf_nan=False)
 
 
 @app.get("/api/filters")
@@ -481,7 +530,8 @@ async def put_filters(body: Filters, request: Request, authorization: str | None
     authorize(authorization)
     monitor = watchlist_access(request, authorization)
     try:
-        monitor.save_filters(body.model_dump())
+        current = asdict(monitor.engines["live"].filters)
+        monitor.save_filters({**current, **body.model_dump(exclude_unset=True)})
     except OSError as exc:
         raise HTTPException(status_code=503, detail="过滤设置保存失败，请重试") from exc
     return monitor.engines["live"].configuration()
