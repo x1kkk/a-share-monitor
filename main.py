@@ -28,6 +28,7 @@ from fetcher import Fetcher, Simulator, demo_seed, eligible
 from closing import SnapshotStore, close_target
 from notifier import Notifier
 from pre_market import MarketCalendar, save_json
+from review import ReviewService
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s | %(message)s")
 # httpx request logs contain complete URLs, including a robot webhook's secret key.
@@ -81,6 +82,8 @@ class Monitor:
         self.sequence = 0
         self.calendar_task: asyncio.Task | None = None
         self.calendar_retry_at = 0.0
+        cache_dir = self.watchlist_path.parent / "review_cache"
+        self.review = ReviewService(self, cache_dir / "mock" if cfg.mock_mode else cache_dir)
         if not self.watchlist_path.exists():
             self.save_watchlist(set(codes))
 
@@ -215,7 +218,9 @@ class Monitor:
                 if not quotes:
                     raise ValueError('no verified closing quotes')
                 books = await self.fetcher.fetch_books({q.code for q in quotes}, now)
-                result = self.engines['live'].update(quotes, books, target, simulated=False)
+                streaks = self.review.base_streaks(now, target.date())
+                result = self.engines['live'].update(quotes, books, target, simulated=False,
+                                                     yesterday_streaks=streaks)
                 result.update(status='closed', mode='closed', session='closed', source='tencent',
                               snapshot_kind='close', as_of=target.isoformat(), time=target.isoformat(),
                               captured_at=now.isoformat(), events=[], using_cached_snapshot=True,
@@ -291,9 +296,10 @@ class Monitor:
                     if mode in {'live', 'mock'}:
                         now = datetime.now(SHANGHAI)
                         engine = self.engines[mode]
+                        streaks = self.review.inject_streaks(now)
                         result = engine.update(quotes, books, now, simulated=mode == "mock",
-                                           yesterday_streaks=self.calendar.yesterday_streaks
-                                           if self.calendar.streaks_ready and mode == "live" else None)
+                                               yesterday_streaks=streaks)
+                        self.review.capture_live(engine, now)
                         result["events"] = self.notifier.publish(result["events"])
                         elapsed = time.monotonic() - started
                         result.update({"status": "ok", "mode": mode, "source": source,
@@ -348,7 +354,7 @@ async def lifespan(app: FastAPI):
         monitor = Monitor(client, settings)
         app.state.monitor = monitor
         tasks = [asyncio.create_task(monitor.poll()), asyncio.create_task(monitor.notifier.worker()),
-                 asyncio.create_task(monitor.fetcher.sectors.run())]
+                 asyncio.create_task(monitor.fetcher.sectors.run()), asyncio.create_task(monitor.review.run())]
         try:
             yield
         finally:
@@ -391,6 +397,43 @@ async def snapshot(request: Request, authorization: str | None = Header(default=
     authorize(authorization)
     # REST refresh/reconnect is state synchronization, never historical sound replay.
     return {**request.app.state.monitor.snapshot, "events": []}
+
+
+@app.get("/api/review/meta")
+async def review_meta(request: Request, authorization: str | None = Header(default=None)):
+    authorize(authorization)
+    return request.app.state.monitor.review.meta()
+
+
+@app.get("/api/review/ladder")
+async def review_ladder(request: Request, mode: Literal["review", "live"] = "review",
+                        date: str | None = None, authorization: str | None = Header(default=None)):
+    authorize(authorization)
+    review = request.app.state.monitor.review
+    if date is not None and (not re.fullmatch(r"[0-9]{4}-[0-9]{2}-[0-9]{2}", date)
+                             or date not in review.meta()["dates"]):
+        raise HTTPException(status_code=422, detail="date must be one of the latest 15 completed sessions")
+    return review.ladder(mode, date)
+
+
+class ReviewRefresh(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    date: str | None = Field(default=None, pattern=r"^[0-9]{4}-[0-9]{2}-[0-9]{2}$")
+    lhb: bool = False
+
+
+@app.post("/api/review/refresh", status_code=202)
+async def review_refresh(body: ReviewRefresh, request: Request,
+                         authorization: str | None = Header(default=None)):
+    authorize(authorization)
+    review = request.app.state.monitor.review
+    try:
+        queued = review.queue_refresh(body.date or review.meta()["default_date"], body.lhb)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    if not queued:
+        raise HTTPException(status_code=429, detail="review refresh already pending or throttled (30 seconds)")
+    return {"status": "queued"}
 
 
 class WatchlistStock(BaseModel):
