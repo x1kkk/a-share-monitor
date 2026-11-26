@@ -213,6 +213,7 @@ onBeforeUnmount(() => {
     <header class="console">
       <div class="brand-row">
         <div class="brand"><svg viewBox="0 0 32 32" aria-hidden="true"><path d="M5 23V9m7 18V5m7 15V10m7 15V6"/><path d="m3 19 8-7 8 3 10-9"/></svg><div><span class="eyebrow">A-SHARE MONITOR</span><h1>主板雷达<span class="brand-divider">/</span><span class="brand-sub">实时盯盘终端</span></h1></div></div>
+        <p class="header-motto"><span>哪有孩子一直哭</span> <span>哪有赌徒一直输</span></p>
         <div class="header-actions"><span v-if="data.session === 'closed'" class="session-badge">盘后休市</span><span class="mode-badge" :class="modeClass"><i/>{{ modeLabel }}</span><button class="icon-button" @click="authOpen = !authOpen" :aria-expanded="authOpen" aria-controls="connection-settings" aria-label="展开连接设置"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M9 3h6l1 3 3 1 2 5-2 5-3 1-1 3H9l-1-3-3-1-2-5 2-5 3-1z"/><circle cx="12" cy="12" r="3"/></svg></button></div>
       </div>
       <div class="console-bottom">
