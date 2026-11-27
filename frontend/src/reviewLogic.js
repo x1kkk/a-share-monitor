@@ -9,6 +9,11 @@ export const SORT_OPTIONS = [
   { value: 'turnover_rate', label: '按换手率 ↓' },
 ]
 export const FAILED_SORT_OPTIONS = [...SORT_OPTIONS.filter(option => option.value !== 'seal_amount'), { value: 'change_pct', label: '按涨跌幅 ↓' }]
+export function conceptPreview(concepts, expanded = false) {
+  const tags = Array.isArray(concepts) ? [...new Set(concepts.filter(tag => typeof tag === 'string' && tag.trim()).map(tag => tag.trim()))] : []
+  return { visible: expanded ? tags : tags.slice(0, 4), remaining: Math.max(0, tags.length - 4), expanded: expanded === true }
+}
+export function showCardDetails(view = 'compact', expanded = false) { return view === 'detailed' || expanded === true }
 export function effectiveSort(globalSort, overrides, key) { return overrides[key] || globalSort }
 export function sortRows(rows, sort = 'score') {
   const key = sort === 'score' ? 'ladder_score' : sort

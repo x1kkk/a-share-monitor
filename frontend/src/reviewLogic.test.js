@@ -1,6 +1,33 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { SORT_OPTIONS, FAILED_SORT_OPTIONS, effectiveSort, sortRows, filterRows, groupRows, statusClass, money, numberText, percent, reviewRoute, timestampText } from './reviewLogic.js'
+import { SORT_OPTIONS, FAILED_SORT_OPTIONS, conceptPreview, showCardDetails, effectiveSort, sortRows, filterRows, groupRows, statusClass, money, numberText, percent, reviewRoute, timestampText } from './reviewLogic.js'
+
+test('concept preview defaults to four tags, reports +N, and expands without mutating the source', () => {
+  const concepts = Array.from({ length: 26 }, (_, index) => `概念${index + 1}`)
+  assert.deepEqual(conceptPreview(concepts), { visible: concepts.slice(0, 4), remaining: 22, expanded: false })
+  assert.deepEqual(conceptPreview(concepts, true), { visible: concepts, remaining: 22, expanded: true })
+  assert.deepEqual(conceptPreview(concepts, false).visible, concepts.slice(0, 4))
+  assert.equal(concepts.length, 26)
+  for (const count of [0, 1, 4, 5]) {
+    const preview = conceptPreview(concepts.slice(0, count))
+    assert.equal(preview.visible.length, Math.min(count, 4))
+    assert.equal(preview.remaining, Math.max(0, count - 4))
+  }
+})
+test('concept preview handles missing tags, blanks and duplicate labels', () => {
+  for (const value of [undefined, null, '', '概念', {}]) assert.deepEqual(conceptPreview(value).visible, [])
+  assert.deepEqual(conceptPreview([' 人工智能 ', null, '', '人工智能', '机器人', '  ']).visible, ['人工智能', '机器人'])
+})
+test('compact mode hides secondary metrics unless expanded; detailed mode always shows them', () => {
+  assert.equal(showCardDetails(), false)
+  assert.equal(showCardDetails('compact', false), false)
+  assert.equal(showCardDetails('compact', true), true)
+  assert.equal(showCardDetails('detailed', false), true)
+  assert.equal(showCardDetails('detailed', true), true)
+  assert.equal(showCardDetails('compact', undefined), false)
+  // Detail density must not implicitly expand concept labels.
+  assert.equal(conceptPreview(Array.from({ length: 24 }, (_, i) => `标签${i}`)).visible.length, 4)
+})
 
 test('all five descending sorters preserve null at the bottom and do not mutate rows', () => {
   assert.equal(SORT_OPTIONS.length, 5)
