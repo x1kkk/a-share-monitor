@@ -28,6 +28,12 @@ def number(value: object, default: float = 0.0) -> float:
         return default
 
 
+def whole_lots(value: object) -> int | None:
+    """Tencent counters are cumulative hands; malformed data is unknown, not zero."""
+    parsed = number(value, math.nan)
+    return int(parsed) if math.isfinite(parsed) and parsed >= 0 and parsed.is_integer() else None
+
+
 def limit_price(pre_close: float, *, rate: float = 0.10) -> float:
     return float((Decimal(str(pre_close)) * (Decimal(1) + Decimal(str(rate)))).quantize(
         Decimal("0.01"), rounding=ROUND_HALF_UP))
@@ -56,6 +62,8 @@ class Quote:
     split_estimated: bool = False
     flow_epoch: int = 0
     observed_since: date | None = None
+    outer_vol: int | None = None
+    inner_vol: int | None = None
 
 
 @dataclass(frozen=True)
@@ -64,6 +72,10 @@ class Book:
     buy_lots: float
     sell_lots: float
     ts: float
+    bids: tuple[tuple[float, int], ...] = ()
+    asks: tuple[tuple[float, int], ...] = ()
+    # Empty/invalid levels are omitted from bids without renumbering buy two as buy one.
+    bid_levels: tuple[int, ...] = ()
 
 
 def parse_quote(row: dict, *, now: datetime | None = None) -> Quote | None:
@@ -112,7 +124,18 @@ def parse_books(text: str) -> dict[str, Book]:
             ts = datetime.strptime(fields[30], "%Y%m%d%H%M%S").replace(tzinfo=SHANGHAI).timestamp()
             price, buy, sell = (number(fields[i], -1) for i in (3, 10, 20))
             if price > 0 and buy >= 0 and sell >= 0:
-                result[code] = Book(price, buy, sell, ts)
+                def levels(start):
+                    valid = []
+                    for level in range(5):
+                        level_price = number(fields[start + 2 * level], -1)
+                        lots = whole_lots(fields[start + 2 * level + 1])
+                        if level_price > 0 and lots is not None and lots > 0:
+                            valid.append((level + 1, (level_price, lots)))
+                    return valid
+
+                bids, asks = levels(9), levels(19)
+                result[code] = Book(price, buy, sell, ts, tuple(pair for _, pair in bids),
+                                    tuple(pair for _, pair in asks), tuple(level for level, _ in bids))
         except ValueError:
             continue
     return result
@@ -146,8 +169,11 @@ def parse_tencent(text: str, stocks: dict[str, dict]) -> tuple[dict[str, Quote],
                              0, 0, 0, high=values[33], source_ts=ts,
                              flow_source="snapshot_estimate", split_estimated=True,
                              observed_since=date.fromisoformat(meta["observed_since"])
-                             if meta.get("observed_since") else None)
-        counters[code] = tuple(number(fields[i], -1) for i in (7, 8))
+                             if meta.get("observed_since") else None,
+                             outer_vol=whole_lots(fields[7]), inner_vol=whole_lots(fields[8]))
+        # The legacy flow estimator uses -1 as an explicit unavailable-counter
+        # sentinel; public Quote fields preserve missing values as None.
+        counters[code] = tuple(value if (value := whole_lots(fields[i])) is not None else -1 for i in (7, 8))
     if seen != stocks.keys():
         raise ValueError(f"incomplete Tencent snapshot: {len(seen)}/{len(stocks)}")
     return quotes, parse_books(text), counters
@@ -458,11 +484,16 @@ class Simulator:
         remaining = sorted(c for c in codes if c not in self.cohort)
         self.plunging = set(remaining[:3])
         self.warm_plunging = set(remaining[3:6])
+        # Dedicated actors keep the support -> sweep -> rise timeline free from
+        # the first-phase fast-rise and limit-up demonstrations.
+        self.support_code = remaining[6] if len(remaining) > 6 else None
+        self.smash_code = remaining[7] if len(remaining) > 7 else None
 
     def step(self, now: datetime) -> tuple[list[Quote], dict[str, Book]]:
         self.tick += 1
         # First tick is the baseline. Then a random subset rises by 0.8%-2.5%.
         phase = self.tick % 240
+        scenario_seconds = 2 * ((self.tick - 1) % 240)
         stimulated = self.rng.sample(self.cohort, min(3, len(self.cohort))) if (
             2 <= phase <= 14 or 90 <= phase <= 98) else []
         books = {}
@@ -472,6 +503,7 @@ class Simulator:
             price, flow = old.price, old.main_inflow
             resetting = (code in self.cohort or code in self.plunging or code in self.warm_plunging) and (
                 self.tick == 1 or phase == 0)
+            resetting |= code in {self.support_code, self.smash_code} and scenario_seconds == 0
             if resetting:
                 price = round(base.pre_close * 0.99, 2)
                 flow = 0.0
@@ -493,14 +525,42 @@ class Simulator:
                 price = ceiling
             elif code in self.sealed and phase == 31:
                 price = round(ceiling - base.pre_close * 0.02, 2)
+            sweep = code == self.support_code and scenario_seconds == 40
+            smash = code == self.smash_code and scenario_seconds == 44
+            rapid = code == self.support_code and scenario_seconds in {50, 52, 54}
+            plunge = code == self.smash_code and scenario_seconds in {46, 48}
+            if sweep or rapid:
+                change = 0.004 if sweep else 0.01
+                price = min(round(price + base.pre_close * change, 2), ceiling - 0.01)
+                flow += 6e6 if sweep else 2e6
+            elif smash or plunge:
+                change = 0.004 if smash else 0.01
+                price = max(round(price - base.pre_close * change, 2),
+                            limit_price(base.pre_close, rate=-0.10) + 0.01)
+                flow -= 6e6 if smash else 2e6
             # Afterwards hold steady: unsealed anomalies can turn gray and disappear.
             lots = 1200 if diving or code in stimulated else 100
+            if sweep or smash:
+                lots = max(lots, math.ceil(6_000_000 / (price * 100)))
+            outer_share = 0.9 if sweep or rapid else 0.1 if smash or plunge else 0.5
+            outer_delta = int(lots * outer_share)
+            old_outer = old.outer_vol if old.outer_vol is not None else int(old.volume // 2)
+            old_inner = old.inner_vol if old.inner_vol is not None else int(old.volume - old_outer)
             q = replace(base, price=price, pct=round((price / base.pre_close - 1) * 100, 4),
                         main_inflow=flow, super_inflow=flow * 0.6, large_inflow=flow * 0.4,
                         amount=old.amount + price * lots * 100, volume=old.volume + lots,
+                        outer_vol=old_outer + outer_delta, inner_vol=old_inner + lots - outer_delta,
                         flow_epoch=old.flow_epoch + int(resetting),
                         high=max(old.high, price), source_ts=now.timestamp())
             self.current[code] = q
-            books[code] = Book(price, self.rng.randint(1000, 30000) if price >= ceiling else 100,
-                               0 if price >= ceiling else 500, now.timestamp())
+            buy_lots = self.rng.randint(1000, 30000) if price >= ceiling else 100
+            bids = tuple((round(price - level * .01, 2), buy_lots if level == 0 else 100)
+                         for level in range(5) if price - level * .01 > 0)
+            if code == self.support_code and scenario_seconds <= 34:
+                bids = tuple((p, math.ceil(12_000_000 / (p * 100)) if level == 2 else lots)
+                             for level, (p, lots) in enumerate(bids, 1))
+            asks = () if price >= ceiling else tuple((round(price + (level + 1) * .01, 2), 500)
+                                                     for level in range(5))
+            books[code] = Book(price, buy_lots, 0 if price >= ceiling else 500, now.timestamp(),
+                               bids, asks, tuple(range(1, len(bids) + 1)))
         return list(self.current.values()), books

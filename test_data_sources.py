@@ -15,7 +15,7 @@ import httpx
 
 from config import SHANGHAI, Settings
 from engine import Engine
-from fetcher import Fetcher, Simulator, demo_seed, eligible, parse_flows, parse_tencent, parse_quote
+from fetcher import Book, Fetcher, Simulator, demo_seed, eligible, parse_books, parse_flows, parse_tencent, parse_quote
 from pre_market import MarketCalendar, Universe, stock_rows
 
 
@@ -92,6 +92,19 @@ class TencentSnapshotChecks(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(books), 3050)
         self.assertEqual((books[q.code].buy_lots, books[q.code].sell_lots), (1234, 567))
         self.assertEqual(len(self.requests), 10)
+
+    async def test_empty_limit_books_and_missing_active_counters_do_not_reject_round(self):
+        self.mutation = lambda codes, lines, request: [
+            quote_line(code, self.now, invalid={**{i: 0 for i in range(9, 29)}, 7: '-', 8: ''})
+            for code in codes]
+        quotes = await self.fetcher.fetch_market()
+        self.assertEqual(len(quotes), len(self.stocks))
+        for quote in quotes:
+            self.assertIsNone(quote.outer_vol)
+            self.assertIsNone(quote.inner_vol)
+            book = self.fetcher.last_books[quote.code]
+            self.assertEqual((book.bids, book.asks), ((), ()))
+            self.assertEqual((book.buy_lots, book.sell_lots), (0, 0))
 
     async def test_failed_missing_duplicate_and_invalid_batches_do_not_commit(self):
         self.stocks = stock_pool(652)
@@ -370,6 +383,128 @@ class PreMarketCacheChecks(unittest.IsolatedAsyncioTestCase):
 
 
 class SourceBoundaryChecks(unittest.TestCase):
+    def test_tencent_five_levels_keep_original_indices_and_legacy_book_fields(self):
+        now = datetime(2026, 11, 26, 10, tzinfo=SHANGHAI)
+        stocks = stock_pool(2)
+        code = next(iter(stocks))
+        fields = {}
+        for level in range(5):
+            fields[9 + level * 2] = 10.49 - level * .01
+            fields[10 + level * 2] = 100 + level
+            fields[19 + level * 2] = 10.51 + level * .01
+            fields[20 + level * 2] = 200 + level
+        text = quote_line(code, now, buy=700, sell=300, invalid=fields)
+        quotes, books, _ = parse_tencent(text, {code: stocks[code]})
+        quote, book = quotes[code], books[code]
+        self.assertEqual((quote.outer_vol, quote.inner_vol), (700, 300))
+        self.assertEqual(len(book.bids), 5)
+        self.assertEqual(len(book.asks), 5)
+        self.assertEqual(book.bid_levels, (1, 2, 3, 4, 5))
+        self.assertEqual((book.price, book.buy_lots, book.sell_lots, book.ts), (10.5, 100, 200, now.timestamp()))
+        self.assertEqual(Book(10, 100, 0, now.timestamp()).bids, ())
+        # A zero buy-one and malformed intermediate prices must not shift the
+        # original buy-two label or invalidate the main quote snapshot.
+        fields.update({9: 0, 10: 0, 13: 'NaN', 17: -1, 19: 0, 20: 0, 23: 0, 24: 0})
+        text = quote_line(code, now, invalid=fields)
+        quotes, books, _ = parse_tencent(text, {code: stocks[code]})
+        self.assertIn(code, quotes)
+        self.assertEqual(books[code].bid_levels, (2, 4))
+        self.assertEqual(books[code].bids[0], (10.48, 101))
+        self.assertEqual(len(books[code].asks), 3)
+        self.assertEqual(parse_books(text), books)
+
+    def test_invalid_outer_inner_counters_are_unknown_but_zero_is_real(self):
+        now = datetime(2026, 11, 26, 10, tzinfo=SHANGHAI)
+        stocks = stock_pool(2)
+        code = next(iter(stocks))
+        for value in ('', '-', 'NaN', 'inf', '-1', '2.5'):
+            with self.subTest(value=value):
+                quotes, _, counters = parse_tencent(quote_line(code, now, buy=value, sell=value),
+                                                    {code: stocks[code]})
+                self.assertIsNone(quotes[code].outer_vol)
+                self.assertIsNone(quotes[code].inner_vol)
+                self.assertEqual(counters[code], (-1, -1))
+        quotes, _, _ = parse_tencent(quote_line(code, now, buy=0, sell=0), {code: stocks[code]})
+        self.assertEqual((quotes[code].outer_vol, quotes[code].inner_vol), (0, 0))
+
+    def test_simulator_support_sweep_rise_and_smash_are_timed_and_monotonic(self):
+        simulator = Simulator(demo_seed(), Settings(), 'phase2_test')
+        now = datetime(2026, 11, 26, 10, tzinfo=SHANGHAI)
+        previous, frames = {}, {}
+        for second in range(0, 483, 2):
+            quotes, books = simulator.step(now + timedelta(seconds=second))
+            by_code = {q.code: q for q in quotes}
+            for q in quotes:
+                if q.code in previous:
+                    old = previous[q.code]
+                    self.assertGreaterEqual(q.amount, old.amount)
+                    self.assertGreaterEqual(q.volume, old.volume)
+                    self.assertGreaterEqual(q.outer_vol, old.outer_vol)
+                    self.assertGreaterEqual(q.inner_vol, old.inner_vol)
+                if books[q.code].sell_lots == 0:
+                    self.assertEqual(books[q.code].asks, ())
+            if second <= 54:
+                frames[second] = (by_code, books)
+            if second == 480:
+                self.assertGreater(by_code[simulator.support_code].flow_epoch,
+                                   previous[simulator.support_code].flow_epoch)
+            previous = by_code
+        support = simulator.support_code
+        for second in range(0, 35, 2):
+            q = frames[second][0][support]
+            book = frames[second][1][support]
+            price, lots = book.bids[1]
+            self.assertGreaterEqual(price * lots * 100, 12e6)
+            self.assertGreaterEqual(lots, 5 * max(pair[1] for i, pair in enumerate(book.bids) if i != 1))
+            self.assertLess(q.price, q.pre_close * 1.10)
+        q38, q40 = (frames[t][0][support] for t in (38, 40))
+        self.assertGreaterEqual(q40.amount - q38.amount, 5e6)
+        self.assertGreater(q40.outer_vol - q38.outer_vol, 1.5 * (q40.inner_vol - q38.inner_vol))
+        self.assertGreaterEqual((q40.price - q38.price) / q40.pre_close * 100, .3)
+        q54 = frames[54][0][support]
+        self.assertGreaterEqual((q54.price - frames[0][0][support].price) / q54.pre_close * 100, 2)
+        smash = simulator.smash_code
+        q42, q44 = (frames[t][0][smash] for t in (42, 44))
+        self.assertGreaterEqual(q44.amount - q42.amount, 5e6)
+        self.assertGreater(q44.inner_vol - q42.inner_vol, 1.5 * (q44.outer_vol - q42.outer_vol))
+        self.assertLessEqual((q44.price - q42.price) / q44.pre_close * 100, -.3)
+        q48 = frames[48][0][smash]
+        self.assertLessEqual((q48.price - frames[0][0][smash].price) / q48.pre_close * 100, -2)
+
+    def test_simulator_engine_emits_exact_orderbook_timeline(self):
+        cfg = Settings()
+        simulator, engine = Simulator(demo_seed(), cfg, 'phase2_timeline'), Engine(cfg)
+        now = datetime(2026, 11, 26, 10, tzinfo=SHANGHAI)
+        actual = []
+        for second in range(0, 61, 2):
+            current = now + timedelta(seconds=second)
+            quotes, books = simulator.step(current)
+            rows = {q.code: q for q in quotes}
+            result = engine.update(quotes, books, current, clock=second, simulated=True)
+            for event in result['events']:
+                if event['signal_type'] == 'large_order_support':
+                    self.assertLess(rows[event['code']].price, rows[event['code']].pre_close * 1.1)
+                if event['code'] in {simulator.support_code, simulator.smash_code}:
+                    actual.append((second, event['code'], event['signal_type']))
+                    if event['signal_type'] == 'large_order_support':
+                        self.assertFalse(event['signal_estimated'])
+                        self.assertEqual(event['support_info']['level'], 2)
+                        self.assertEqual(event['support_info']['duration_seconds'], 30)
+                    elif event['signal_type'] in {'suspected_active_buy', 'suspected_large_smash'}:
+                        self.assertTrue(event['signal_estimated'])
+                        self.assertIn('快照估算', event['reason'])
+        self.assertEqual(actual, [
+            (30, simulator.support_code, 'large_order_support'),
+            (40, simulator.support_code, 'suspected_active_buy'),
+            (44, simulator.smash_code, 'suspected_large_smash'),
+            (48, simulator.smash_code, 'heavy_plunge'),
+            (52, simulator.support_code, 'rapid_rise')])
+        board = {row['code']: row for row in result['anomalies']}
+        self.assertEqual([item['signal_type'] for item in board[simulator.support_code]['timeline']],
+                         ['rapid_rise', 'suspected_active_buy', 'large_order_support'])
+        self.assertEqual([item['signal_type'] for item in board[simulator.smash_code]['timeline']],
+                         ['heavy_plunge', 'suspected_large_smash'])
+
     def test_st_survives_metadata_and_both_quote_adapters(self):
         now = datetime(2026, 11, 26, 10, tzinfo=SHANGHAI)
         stocks = stock_rows([{"code": "600001", "name": "*ST测试", "listed": "2010-01-04"}])
