@@ -1,0 +1,30 @@
+[Unit]
+Description=Snake Club static game
+After=network.target
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+[Service]
+Type=simple
+DynamicUser=yes
+WorkingDirectory=/opt/apps/snake-game/current
+ExecStart=/opt/apps/a-share-monitor/.venv/bin/python -m uvicorn server:app --host 0.0.0.0 --port 8091 --workers 1 --limit-concurrency 50 --timeout-keep-alive 5 --no-access-log --no-proxy-headers --no-server-header
+Environment=PYTHONDONTWRITEBYTECODE=1
+Restart=on-failure
+RestartSec=3
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+LockPersonality=yes
+MemoryMax=96M
+TasksMax=32
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target
