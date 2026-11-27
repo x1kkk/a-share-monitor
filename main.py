@@ -29,6 +29,7 @@ from closing import SnapshotStore, close_target
 from notifier import Notifier
 from pre_market import MarketCalendar, save_json
 from review import ReviewService
+from deviation import DeviationService
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s | %(message)s")
 # httpx request logs contain complete URLs, including a robot webhook's secret key.
@@ -84,6 +85,7 @@ class Monitor:
         self.calendar_retry_at = 0.0
         cache_dir = self.watchlist_path.parent / "review_cache"
         self.review = ReviewService(self, cache_dir / "mock" if cfg.mock_mode else cache_dir)
+        self.deviation = DeviationService(self, self.watchlist_path.parent / "deviation_cache")
         if not self.watchlist_path.exists():
             self.save_watchlist(set(codes))
 
@@ -354,7 +356,8 @@ async def lifespan(app: FastAPI):
         monitor = Monitor(client, settings)
         app.state.monitor = monitor
         tasks = [asyncio.create_task(monitor.poll()), asyncio.create_task(monitor.notifier.worker()),
-                 asyncio.create_task(monitor.fetcher.sectors.run()), asyncio.create_task(monitor.review.run())]
+                 asyncio.create_task(monitor.fetcher.sectors.run()), asyncio.create_task(monitor.review.run()),
+                 asyncio.create_task(monitor.deviation.run())]
         try:
             yield
         finally:
@@ -433,6 +436,44 @@ async def review_refresh(body: ReviewRefresh, request: Request,
         raise HTTPException(status_code=422, detail=str(exc)) from exc
     if not queued:
         raise HTTPException(status_code=429, detail="review refresh already pending or throttled (30 seconds)")
+    return {"status": "queued"}
+
+
+@app.get("/api/deviation/meta")
+async def deviation_meta(request: Request, authorization: str | None = Header(default=None)):
+    authorize(authorization)
+    return request.app.state.monitor.deviation.meta()
+
+
+@app.get("/api/deviation/report")
+async def deviation_report(request: Request, date: str | None = None,
+                           authorization: str | None = Header(default=None)):
+    authorize(authorization)
+    deviation = request.app.state.monitor.deviation
+    if date is not None and (not re.fullmatch(r"[0-9]{4}-[0-9]{2}-[0-9]{2}", date)
+                             or date not in deviation.meta()["dates"]):
+        raise HTTPException(status_code=422, detail="date must be one of the latest 7 completed sessions")
+    return deviation.report(date)
+
+
+class DeviationRefresh(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    date: str | None = Field(default=None, pattern=r"^[0-9]{4}-[0-9]{2}-[0-9]{2}$")
+
+
+@app.post("/api/deviation/refresh", status_code=202)
+async def deviation_refresh(body: DeviationRefresh, request: Request,
+                            authorization: str | None = Header(default=None)):
+    authorize(authorization)
+    deviation = request.app.state.monitor.deviation
+    try:
+        queued = deviation.queue_refresh(body.date or deviation.meta()["default_date"])
+    except PermissionError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    if not queued:
+        raise HTTPException(status_code=429, detail="deviation settlement pending or throttled (30 seconds)")
     return {"status": "queued"}
 
 

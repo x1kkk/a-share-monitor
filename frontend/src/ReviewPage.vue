@@ -98,7 +98,7 @@ onBeforeUnmount(() => { stopped = true; sequence++; clearTimeout(pollTimer); con
 <template>
   <div class="terminal review-page" :class="{ 'review-detailed': view === 'detailed' }">
     <header class="console review-console">
-      <div class="review-topline"><a class="secondary-button" href="#/">← 返回实时盯盘</a><span class="eyebrow">MAIN BOARD / 15 SESSION REVIEW</span><button class="text-button" :aria-expanded="authOpen" @click="authOpen = !authOpen">连接设置</button></div>
+      <div class="review-topline"><a class="secondary-button" href="#/">← 返回实时盯盘</a><a class="secondary-button" href="#/deviation">异动红线</a><span class="eyebrow">MAIN BOARD / 15 SESSION REVIEW</span><button class="text-button" :aria-expanded="authOpen" @click="authOpen = !authOpen">连接设置</button></div>
       <div class="review-title"><div><h1>主板涨停梯队与 15 日复盘中心</h1><p>00 / 60 主板 · 剔除 ST · 由首板逐级展开</p></div><span v-if="meta.simulated" class="mode-badge mock">模拟演练 MOCK</span><span v-else class="mode-badge closed">{{ mode === 'live' ? '盘中实时' : '收盘锁定' }}</span></div>
       <nav class="review-tabs" aria-label="复盘页面切换"><button :class="{ selected: tab === 'success' }" :aria-pressed="tab === 'success'" @click="tab = 'success'">涨停梯队（主页）<b>{{ numberText(summary.limit_up_count, 0) }}</b></button><button :class="{ selected: tab === 'failed' }" :aria-pressed="tab === 'failed'" @click="tab = 'failed'">晋级失败（副页）<b>{{ numberText(failedCount, 0) }}</b></button></nav>
       <div class="review-controls">

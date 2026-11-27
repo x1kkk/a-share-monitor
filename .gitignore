@@ -25,3 +25,4 @@ sector_cache.json
 market_snapshot.json
 company_sectors.json
 review_cache/
+deviation_cache/

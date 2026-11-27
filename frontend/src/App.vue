@@ -10,6 +10,7 @@ const draft = reactive({ ...DEFAULT_WEIGHTS }), dirty = ref(false), saving = ref
 const filterDraft = reactive({ ...DEFAULT_FILTERS }), filterDirty = ref(false), filterSaving = ref(false), filterReady = ref(false), filterMessage = ref('等待服务端筛选设置')
 const directionFilter = ref('all')
 const openReview = () => { window.location.hash = '/review' }
+const openDeviation = () => { window.location.hash = '/deviation' }
 let acknowledgedFilters = null
 let savedToken = ''
 try { savedToken = sessionStorage.getItem('monitor-token') || '' } catch { /* Browser privacy settings can disable storage. */ }
@@ -218,7 +219,7 @@ onBeforeUnmount(() => {
       </div>
       <div class="console-bottom">
         <div class="telemetry"><div class="clock"><span class="eyebrow">北京时间</span><strong>{{ localTime(wallClock) }}</strong></div><div><span class="metric-caption">监控主板股票</span><strong>{{ numeric(data.stock_count) ? Number(data.stock_count).toLocaleString('zh-CN') : '--' }}<small>只</small></strong></div><div><span class="metric-caption">单轮刷新耗时</span><strong>{{ numeric(data.cycle_ms) ? Math.round(data.cycle_ms) : '--' }}<small>ms</small></strong></div><div class="connection-summary"><span class="connection-label" :class="{ 'is-stale': stale || data.status === 'recovering' }"><i/>{{ connectionLabel }}</span><span class="metric-caption">快照 {{ data.time ? String(data.time).slice(0, 10) : '' }} {{ localTime(data.time) }}</span></div></div>
-        <div class="console-buttons"><button class="sound-button" @click="openReview">涨停梯队复盘</button><button class="sound-button" :class="{ enabled: sound }" @click="enableSound"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m11 5-6 4H2v6h3l6 4zM15 8a6 6 0 0 1 0 8m3-11a10 10 0 0 1 0 14"/></svg>{{ sound ? '声音提醒已开启' : '点击开启盯盘声音' }}</button><button class="secondary-button" @click="filtersOpen = !filtersOpen" :aria-expanded="filtersOpen" aria-controls="signal-settings"><span aria-hidden="true">⚙</span>异动设置</button><button class="secondary-button" @click="weightsOpen = !weightsOpen" :aria-expanded="weightsOpen" aria-controls="weights-panel">强度分权重 <span>{{ weightsOpen ? '−' : '+' }}</span></button></div>
+        <div class="console-buttons"><button class="sound-button" @click="openDeviation">异动红线</button><button class="sound-button" @click="openReview">涨停梯队复盘</button><button class="sound-button" :class="{ enabled: sound }" @click="enableSound"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m11 5-6 4H2v6h3l6 4zM15 8a6 6 0 0 1 0 8m3-11a10 10 0 0 1 0 14"/></svg>{{ sound ? '声音提醒已开启' : '点击开启盯盘声音' }}</button><button class="secondary-button" @click="filtersOpen = !filtersOpen" :aria-expanded="filtersOpen" aria-controls="signal-settings"><span aria-hidden="true">⚙</span>异动设置</button><button class="secondary-button" @click="weightsOpen = !weightsOpen" :aria-expanded="weightsOpen" aria-controls="weights-panel">强度分权重 <span>{{ weightsOpen ? '−' : '+' }}</span></button></div>
       </div>
       <p v-if="soundError" class="error-message" role="alert">{{ soundError }}</p>
       <section v-if="filtersOpen" id="signal-settings" class="signal-settings" aria-label="异动监控筛选设置">
