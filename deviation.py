@@ -221,6 +221,7 @@ class DeviationService:
         self.last_manual = None
         self.retry_at = {}
         self.stock_retry_at = 0.0
+        self.eastmoney_retry_at = 0.0
         self.loaded = set()
 
     def sessions(self, now):
@@ -310,8 +311,11 @@ class DeviationService:
 
     async def worker(self, operation, **args):
         async with self.processes:
-            if operation == "stock" and time.monotonic() < self.stock_retry_at:
-                return {"rows": [], "status": "unavailable", "error": "rate_limit_cooldown"}
+            if operation in {"stock", "benchmarks"}:
+                args.update(skip_eastmoney=time.monotonic() < self.eastmoney_retry_at,
+                            skip_sina=time.monotonic() < self.stock_retry_at)
+                if operation == "stock" and args["skip_eastmoney"] and args["skip_sina"]:
+                    return {"rows": [], "status": "unavailable", "error": "rate_limit_cooldown"}
             process = None
             env = {k: v for k, v in os.environ.items() if k.upper() not in {"HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY"}}
             if self.cfg.http_proxy:
@@ -325,7 +329,10 @@ class DeviationService:
                 if process.returncode:
                     raise ValueError("deviation data worker failed")
                 data = json.loads(stdout)
-                if data.get("rate_limited"):
+                limited = data.get("limited_sources", {})
+                if limited.get("eastmoney"):
+                    self.eastmoney_retry_at = time.monotonic() + 1200
+                if limited.get("sina"):
                     self.stock_retry_at = time.monotonic() + 1200
                 return data
             finally:
@@ -387,6 +394,7 @@ class DeviationService:
                         metrics = calculate_metrics(data.get("rows", []), benchmark.get("rows", []), window)
                         ready = all(metrics[k] is not None for k in ("dev_10", "dev_30", "remain_10", "remain_30"))
                         return {**candidate, **metrics, "data_status": "ready" if ready else "partial",
+                                "price_source": data.get("source"),
                                 "benchmark": {k: v for k, v in benchmark.items() if k != "rows"}}
                     except (ValueError, TimeoutError, OSError, KeyError, TypeError):
                         return {**candidate, **classify_item({}), "data_status": "unavailable",

@@ -58,10 +58,11 @@ def timeout(seconds):
         pass  # Older releases are still bounded by the parent's kill deadline.
 
 
-def benchmark(ak, market, alternatives, dates):
+def benchmark(ak, market, alternatives, dates, *, skipped=None):
+    limited = {"eastmoney": False, "sina": False}
     best = {"market": market, "code": alternatives[0][0], "name": alternatives[0][1],
             "fallback": False, "status": "unavailable", "source": None, "rows": [],
-            "rate_limited": False}
+            "rate_limited": False, "limited_sources": limited}
     for index, (code, name) in enumerate(alternatives):
         symbol = market + code
         # Sources may differ; the benchmark identity must never silently differ.
@@ -70,27 +71,33 @@ def benchmark(ak, market, alternatives, dates):
                 symbol=symbol, start_date=dates[0].replace("-", ""), end_date=dates[-1].replace("-", ""))),
             ("akshare.stock_zh_index_daily", lambda: ak.stock_zh_index_daily(symbol=symbol)),
         ):
+            provider = "eastmoney" if source.endswith("_em") else "sina"
+            if limited[provider] or (skipped or {}).get(provider):
+                continue
             try:
                 rows = close_rows(fetch().to_dict("records"), dates)
                 result = {"market": market, "code": code, "name": name, "fallback": bool(index),
                           "status": "ready" if len(rows) == len(dates) else "unavailable",
-                          "source": source, "rows": rows, "rate_limited": best["rate_limited"]}
+                          "source": source, "rows": rows, "rate_limited": any(limited.values()), "limited_sources": limited}
                 if result["status"] == "ready":
                     return result
                 if len(rows) > len(best["rows"]):
                     best = result
             except Exception as exc:
                 print(f"deviation benchmark {symbol}: {type(exc).__name__}", file=sys.stderr)
-                best["rate_limited"] |= rate_limited(exc)
+                limited[provider] |= rate_limited(exc)
+                best["rate_limited"] = any(limited.values())
     return best
 
 
-def benchmarks(ak, dates):
+def benchmarks(ak, dates, *, skipped=None):
     # Only two index downloads can run together. Each subprocess has a kill bound.
     timeout(5)
     with ThreadPoolExecutor(max_workers=2) as pool:
-        results = list(pool.map(lambda row: benchmark(ak, row[0], row[1], dates), BENCHMARKS))
-    return {"benchmarks": results, "rate_limited": any(row["rate_limited"] for row in results)}
+        results = list(pool.map(lambda row: benchmark(ak, row[0], row[1], dates, skipped=skipped), BENCHMARKS))
+    return {"benchmarks": results, "rate_limited": any(row["rate_limited"] for row in results),
+            "limited_sources": {provider: any(row["limited_sources"][provider] for row in results)
+                                for provider in ("eastmoney", "sina")}}
 
 
 def stock(ak, body):
@@ -103,7 +110,7 @@ def stock(ak, body):
     if not start <= dates[0] <= dates[-1] <= end:
         raise ValueError("stock range must cover the requested sessions")
     result = {"rows": [], "status": "unavailable", "adjust": "qfq", "source": None,
-              "rate_limited": False}
+              "rate_limited": False, "limited_sources": {"eastmoney": False, "sina": False}}
     sources = (
         ("akshare.stock_zh_a_hist", lambda: ak.stock_zh_a_hist(
             symbol=code, period="daily", start_date=start.replace("-", ""),
@@ -112,10 +119,13 @@ def stock(ak, body):
             symbol=("sh" if code.startswith("60") else "sz") + code,
             start_date=start.replace("-", ""), end_date=end.replace("-", ""), adjust="qfq")),
     )
-    for index, (source, fetch) in enumerate(sources):
+    for source, fetch in sources:
+        provider = "eastmoney" if source == "akshare.stock_zh_a_hist" else "sina"
+        if body.get("skip_" + provider) is True:
+            continue
         # Sina's qfq calculation may request prices, float shares and factors;
         # smaller per-request bounds leave room inside the parent's 35 seconds.
-        if index:
+        if provider == "sina":
             timeout(4)
         try:
             rows = close_rows(fetch().to_dict("records"), dates)
@@ -127,7 +137,7 @@ def stock(ak, body):
             print(f"deviation stock {code}: {type(exc).__name__}", file=sys.stderr)
             if rate_limited(exc):
                 result["rate_limited"] = True
-                break
+                result["limited_sources"][provider] = True
     return result
 
 
@@ -187,7 +197,8 @@ def run(body):
     timeout(8)
     operation = body["operation"]
     if operation == "benchmarks":
-        return benchmarks(ak, requested_dates(body["dates"]))
+        return benchmarks(ak, requested_dates(body["dates"]),
+                          skipped={provider: body.get("skip_" + provider) is True for provider in ("eastmoney", "sina")})
     if operation == "stock":
         return stock(ak, body)
     return candidates(ak, date.fromisoformat(body["date"]).isoformat())

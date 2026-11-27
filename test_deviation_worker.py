@@ -80,16 +80,36 @@ class DeviationWorkerChecks(unittest.TestCase):
         self.assertEqual({row["close"] for row in result["rows"]}, {9})
         self.assertNotIn(DATES[-1], [row["date"] for row in result["rows"]])
 
-    def test_stock_rate_limit_stops_further_requests_and_does_not_fabricate_prices(self):
+    def test_stock_rate_limit_only_skips_the_limited_provider(self):
         class Push2RateLimitError(Exception):
             pass
         ak = types.SimpleNamespace(stock_zh_a_hist=Mock(side_effect=Push2RateLimitError()),
-                                   stock_zh_a_daily=Mock())
-        result = worker.stock(ak, body())
+                                   stock_zh_a_daily=Mock(return_value=Frame(prices(close=12))))
+        with patch.object(worker, "timeout"):
+            result = worker.stock(ak, body())
         self.assertTrue(result["rate_limited"])
-        self.assertEqual(result["rows"], [])
-        self.assertEqual(result["status"], "unavailable")
-        ak.stock_zh_a_daily.assert_not_called()
+        self.assertEqual(result["limited_sources"], {"eastmoney": True, "sina": False})
+        self.assertEqual(result["status"], "ready")
+        self.assertEqual({row["close"] for row in result["rows"]}, {12})
+        ak.stock_zh_a_hist.reset_mock()
+        with patch.object(worker, "timeout"):
+            self.assertEqual(worker.stock(ak, body(skip_eastmoney=True))["status"], "ready")
+        ak.stock_zh_a_hist.assert_not_called()
+
+    def test_benchmark_limit_preserves_a_working_same_index_source(self):
+        class Push2RateLimitError(Exception):
+            pass
+        ak = types.SimpleNamespace(stock_zh_index_daily_em=Mock(side_effect=Push2RateLimitError()),
+                                   stock_zh_index_daily=Mock(return_value=Frame(prices())))
+        with patch.object(worker, "timeout"):
+            result = worker.benchmarks(ak, DATES)
+        self.assertEqual(result["limited_sources"], {"eastmoney": True, "sina": False})
+        self.assertTrue(all(row["status"] == "ready" and not row["fallback"] for row in result["benchmarks"]))
+        ak.stock_zh_index_daily_em.reset_mock()
+        with patch.object(worker, "timeout"):
+            cooled = worker.benchmarks(ak, DATES, skipped={"eastmoney": True})
+        ak.stock_zh_index_daily_em.assert_not_called()
+        self.assertTrue(all(row["status"] == "ready" for row in cooled["benchmarks"]))
 
     def test_benchmarks_try_same_identity_then_label_actual_fallback(self):
         calls = []

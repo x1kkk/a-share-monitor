@@ -320,10 +320,29 @@ class DeviationPersistenceChecks(unittest.IsolatedAsyncioTestCase):
         process.kill.assert_called_once()
         process.wait.assert_awaited_once()
         module.stock_retry_at = deviation.time.monotonic() + 1200
+        module.eastmoney_retry_at = deviation.time.monotonic() + 1200
         with patch("deviation.asyncio.create_subprocess_exec", new=AsyncMock()) as create:
             result = await module.worker("stock", code="600001")
         self.assertEqual(result["status"], "unavailable")
         create.assert_not_called()
+
+    async def test_index_rate_limit_does_not_disable_an_independent_stock_source(self):
+        module = service()
+        response = {"benchmarks": [], "rate_limited": True,
+                    "limited_sources": {"eastmoney": True, "sina": False}}
+        payloads = []
+        async def communicate(payload):
+            payloads.append(json.loads(payload))
+            return json.dumps(response).encode(), b""
+        process = SimpleNamespace(returncode=0, communicate=communicate)
+        with patch("deviation.asyncio.create_subprocess_exec", new=AsyncMock(return_value=process)) as create:
+            await module.worker("benchmarks", dates=[])
+            self.assertGreater(module.eastmoney_retry_at, deviation.time.monotonic())
+            self.assertEqual(module.stock_retry_at, 0)
+            await module.worker("stock", code="600001")
+        self.assertEqual(create.await_count, 2)
+        self.assertTrue(payloads[-1]["skip_eastmoney"])
+        self.assertFalse(payloads[-1]["skip_sina"])
 
 
 class DeviationApiChecks(unittest.TestCase):
