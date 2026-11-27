@@ -1,6 +1,6 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { money, percent, numberText, numeric, eventGate, snapshotRows, rowAge, serialLatest, alertQueue, signalDirection, signalLabel, filterSignals, rowLifetime, filterPayload, sameFilters, canSyncFilters, alertNotes } from './logic.js'
+import { DEFAULT_FILTERS, money, percent, numberText, numeric, eventGate, snapshotRows, rowAge, serialLatest, alertQueue, signalDirection, signalLabel, signalEstimated, outerInnerRatio, timelineRows, timelineTime, filterSignals, rowLifetime, filterPayload, filterError, sameFilters, canSyncFilters, alertNotes } from './logic.js'
 
 test('cash format preserves signs and missing data', () => {
   assert.equal(money(null), '--'); assert.equal(money(0), '0.00')
@@ -58,7 +58,7 @@ test('active TTL boundary locally grays signals without removing them and backen
 
 test('filter writes omit derived thresholds and stale snapshots cannot roll back acknowledged edits', () => {
   const settings = { sensitivity: 'sensitive', exclude_st: true, exclude_low_amount: false }
-  assert.deepEqual(filterPayload({ ...settings, min_daily_amount: 1e8, rise_speed_threshold: 1 }), settings)
+  assert.deepEqual(filterPayload({ ...settings, min_daily_amount: 1e8, rise_speed_threshold: 1 }), { ...DEFAULT_FILTERS, ...settings })
   assert.equal(sameFilters(settings, { ...settings }), true)
   assert.equal(sameFilters(settings, { ...settings, exclude_st: false }), false)
   const acknowledged = { filters: settings, until: 10000 }
@@ -66,6 +66,66 @@ test('filter writes omit derived thresholds and stale snapshots cannot roll back
   assert.equal(canSyncFilters(settings, acknowledged, 1), true)
   assert.equal(canSyncFilters({ ...settings, sensitivity: 'balanced' }, acknowledged, 10000), true)
   assert.equal(canSyncFilters(settings, null), true)
+})
+
+test('phase-two ratio formatting and estimated flags preserve missing values', () => {
+  for (const value of [null, undefined, '', ' ', false, NaN, Infinity, -1]) assert.equal(outerInnerRatio(value), '--')
+  assert.equal(outerInnerRatio(0), '0.00')
+  assert.equal(outerInnerRatio(1.234), '1.23')
+  assert.equal(signalEstimated({ signal_estimated: true }), true)
+  assert.equal(signalEstimated({ is_estimated: true }), true)
+  for (const value of [false, null, undefined, 'true', 1]) assert.equal(signalEstimated({ signal_estimated: value }), false)
+  assert.equal(signalLabel({ signal_type: 'large_order_support' }), '大单托底')
+  assert.equal(signalLabel({ signal_type: 'suspected_active_buy' }), '疑似盘口扫货')
+  assert.equal(signalLabel({ signal_type: 'suspected_large_smash' }), '疑似大单砸盘')
+  assert.equal(signalDirection({ signal_type: 'suspected_active_buy' }), 'bullish')
+  assert.equal(signalDirection({ signal_type: 'large_order_support' }), 'bullish')
+  assert.equal(signalDirection({ signal_type: 'suspected_large_smash' }), 'bearish')
+})
+
+test('timeline display keeps server order and labels, bounds size, and handles local clock times', () => {
+  const entries = Array.from({ length: 12 }, (_, i) => ({ time: `10:08:${String(i).padStart(2, '0')}`, label: `事件${i}` }))
+  const rows = timelineRows(entries)
+  assert.deepEqual(rows, entries.slice(0, 8))
+  assert.notEqual(rows, entries)
+  assert.equal(entries.length, 12)
+  assert.equal(signalLabel(rows[0]), '事件0')
+  assert.deepEqual(timelineRows(null), [])
+  assert.deepEqual(timelineRows([null, false, [], entries[0]]), [entries[0]])
+  assert.equal(timelineTime('10:08:16'), '10:08:16')
+  assert.equal(timelineTime('2026-11-26T00:08:16Z'), '08:08:16')
+  assert.equal(timelineTime('29:99:99'), '--')
+  assert.equal(timelineTime(null), '--')
+})
+
+test('phase-two filter defaults support old snapshots and numeric thresholds are strictly validated', () => {
+  const legacy = { sensitivity: 'balanced', exclude_st: false, exclude_low_amount: false }
+  assert.deepEqual(filterPayload(legacy), DEFAULT_FILTERS)
+  assert.equal(sameFilters(legacy, DEFAULT_FILTERS), true)
+  assert.equal(filterError(DEFAULT_FILTERS), '')
+  assert.equal(filterError({ ...DEFAULT_FILTERS, support_min_amount_wan: 0.001, burst_min_amount_wan: 1e6 }), '')
+  for (const key of ['support_min_amount_wan', 'burst_min_amount_wan']) {
+    for (const value of [null, undefined, '', '1000', false, true, 0, -1, NaN, Infinity, 1000000.01]) assert.ok(filterError({ ...DEFAULT_FILTERS, [key]: value }))
+  }
+  const edited = { ...DEFAULT_FILTERS, enable_orderbook_signals: false, support_min_amount_wan: 1234.5, burst_min_amount_wan: 800 }
+  assert.deepEqual(filterPayload({ ...edited, min_daily_amount: 123, timeline: [] }), edited)
+  assert.equal(sameFilters(edited, DEFAULT_FILTERS), false)
+  assert.equal(canSyncFilters(DEFAULT_FILTERS, { filters: edited, until: 100 }, 99), false)
+  assert.equal(canSyncFilters(edited, { filters: edited, until: 100 }, 99), true)
+})
+
+test('phase-two sound defaults are quieter while existing signal levels and backend overrides remain intact', () => {
+  for (const signal_type of ['large_order_support', 'suspected_active_buy', 'suspected_large_smash']) {
+    assert.equal(alertNotes({ signal_type }).length, 1)
+    assert.equal(alertNotes({ signal_type, is_watchlist: true }).length, 2)
+  }
+  for (const signal_type of ['rapid_rise', 'heavy_plunge']) {
+    assert.equal(alertNotes({ signal_type }).length, 2)
+    assert.equal(alertNotes({ signal_type, is_watchlist: true }).length, 3)
+  }
+  for (const signal_type of ['limit_up', 'break_open']) assert.equal(alertNotes({ signal_type }).length, 3)
+  assert.equal(alertNotes({ signal_type: 'large_order_support', alert_level: 3 }).length, 3)
+  assert.ok(alertNotes({ signal_type: 'suspected_large_smash' })[0] < alertNotes({ signal_type: 'suspected_active_buy' })[0])
 })
 
 test('alert levels map to one/two/three tones with lower bearish pitch', () => {

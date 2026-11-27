@@ -8,8 +8,12 @@ from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timedelta
 from decimal import Decimal
 
-from config import DEFAULT_WEIGHTS, SHANGHAI, FilterSettings, Settings
+from config import DEFAULT_WEIGHTS, SHANGHAI, FilterSettings, Settings, stock_limit_prices
 from fetcher import Book, Quote, demo_seed, limit_price
+
+ORDERBOOK_SIGNALS = {"large_order_support", "suspected_active_buy", "suspected_large_smash"}
+SIGNAL_PRIORITY = {"large_order_support": 0, "suspected_active_buy": 1, "suspected_large_smash": 1,
+                   "rapid_rise": 2, "heavy_plunge": 2, "limit_up": 3, "break_open": 3}
 
 
 def percentiles(values: dict[str, float]) -> dict[str, float]:
@@ -66,6 +70,11 @@ class Engine:
         self.watchlist_condition: dict[str, str | None] = {}
         self.anomaly_signals: dict[str, dict] = {}
         self.watchlist_signals: dict[str, dict] = {}
+        self.orderbook_baselines: dict[str, tuple[float, Quote]] = {}
+        self.support_timers: dict[str, dict[float, float]] = {}
+        self.orderbook_conditions: dict[str, set[str]] = {}
+        self.signal_pending: dict[tuple[str, str], dict] = {}
+        self.timelines: dict[str, deque] = {}
 
     def clear_windows(self) -> None:
         self.histories.clear()
@@ -74,11 +83,101 @@ class Engine:
         self.previous_condition.clear()
         self.pending.clear()
         self.watchlist_condition.clear()
+        self.orderbook_baselines.clear()
+        self.support_timers.clear()
+        self.orderbook_conditions.clear()
+        self.signal_pending.clear()
+        self.timelines.clear()
 
     def set_filters(self, filters: dict) -> None:
+        was_enabled = self.filters.enable_orderbook_signals
         self.filters = FilterSettings(**filters)
         # The next quote evaluates the new thresholds against the old condition.
         # Resetting edge detectors here would duplicate VIP alerts on every PUT.
+        if was_enabled and not self.filters.enable_orderbook_signals:
+            self.orderbook_baselines.clear()
+            self.support_timers.clear()
+            self.orderbook_conditions.clear()
+            self.signal_pending = {key: value for key, value in self.signal_pending.items()
+                                   if key[1] not in ORDERBOOK_SIGNALS}
+
+    def orderbook_signals(self, q: Quote, book: Book | None, now: datetime, clock: float,
+                          reset: bool, ceiling: float, floor: float, allowed: bool) -> dict[str, dict]:
+        old = self.orderbook_baselines.get(q.code)
+        if old:
+            previous = old[1]
+            rollback = any(current is not None and before is not None and current < before
+                           for current, before in ((q.outer_vol, previous.outer_vol), (q.inner_vol, previous.inner_vol)))
+            reset = reset or rollback or clock - old[0] > 10 or clock <= old[0]
+        if reset:
+            old = None
+            self.support_timers.pop(q.code, None)
+            self.orderbook_conditions.pop(q.code, None)
+            for key in list(self.signal_pending):
+                if key[0] == q.code and key[1] in ORDERBOOK_SIGNALS:
+                    del self.signal_pending[key]
+        if not self.filters.enable_orderbook_signals or not allowed:
+            self.orderbook_baselines.pop(q.code, None)
+            self.support_timers.pop(q.code, None)
+            self.orderbook_conditions.pop(q.code, None)
+            return {}
+        self.orderbook_baselines[q.code] = (clock, q)
+        found = {}
+        timers = self.support_timers.get(q.code, {})
+        current_timers = {}
+        strongest = None
+        if book and q.price < ceiling:
+            for index, (price, lots) in enumerate(book.bids):
+                if price <= 0 or lots <= 0 or price >= ceiling:
+                    continue
+                others = [quantity for j, (p, quantity) in enumerate(book.bids)
+                          if j != index and p > 0 and quantity > 0]
+                # No invented historical baseline: at least one other valid bid
+                # is required, and the candidate itself is excluded from its mean.
+                amount = price * lots * 100
+                if (not others or amount < self.filters.support_min_amount_wan * 10000
+                        or lots < sum(others) / len(others) * 5):
+                    continue
+                key = round(price, 2)
+                since = timers.get(key, clock)
+                current_timers[key] = since
+                duration = clock - since
+                if duration >= 30 and (strongest is None or amount > strongest["amount"]):
+                    level = book.bid_levels[index] if len(book.bid_levels) == len(book.bids) else index + 1
+                    strongest = {"level": level, "price": price, "amount": amount,
+                                 "duration_seconds": round(duration, 2)}
+        self.support_timers[q.code] = current_timers
+        if strongest:
+            summary = (f"买{strongest['level']}({strongest['price']:.2f}元)挂单"
+                       f"{strongest['amount'] / 10000:,.0f}万，已连续托底{strongest['duration_seconds']:g}秒")
+            found["large_order_support"] = {"support_info": strongest, "summary": summary}
+        # An adjacent interval longer than six seconds is a new baseline, never
+        # a two-second burst. Startup cumulative counters are never a delta.
+        if old and 0 < clock - old[0] <= 6:
+            previous = old[1]
+            delta_amount = q.amount - previous.amount
+            change = (q.price - previous.price) / previous.price * 100
+            flow = q.main_inflow - previous.main_inflow
+            outer = q.outer_vol - previous.outer_vol if q.outer_vol is not None and previous.outer_vol is not None else None
+            inner = q.inner_vol - previous.inner_vol if q.inner_vol is not None and previous.inner_vol is not None else None
+            if delta_amount >= self.filters.burst_min_amount_wan * 10000:
+                buy = outer > inner * 1.5 if outer is not None and inner is not None else flow > 0
+                sell = inner > outer * 1.5 if outer is not None and inner is not None else flow < 0
+                kind = "suspected_active_buy" if change >= 0.3 - 1e-9 and buy and q.price < ceiling else (
+                    "suspected_large_smash" if change <= -0.3 + 1e-9 and sell and q.price > floor else None)
+                if kind:
+                    dominance = ("外盘占优" if kind == "suspected_active_buy" else "内盘占优") if (
+                        outer is not None and inner is not None) else "内外盘缺失，按主力资金净额增量降级"
+                    summary = (f"{clock - old[0]:g}秒成交额突增{delta_amount / 10000:,.0f}万，{dominance}，"
+                               f"股价{'上冲' if change >= 0 else '回落'}{abs(change):.2f}%")
+                    found[kind] = {"summary": summary, "delta_amount": delta_amount,
+                                   "delta_outer_vol": outer, "delta_inner_vol": inner,
+                                   "delta_main_inflow": flow, "burst_change_pct": change,
+                                   "burst_window_seconds": round(clock - old[0], 2)}
+        return found
+
+    def timeline(self, code: str) -> list[dict]:
+        return list(reversed(self.timelines.get(code, ())))[:8]
 
     def configuration(self) -> dict:
         return {"filters": self.filters.snapshot(), "ttl": {
@@ -119,10 +218,12 @@ class Engine:
                 "vol_ratio": round(ratio, 6) if ratio is not None else None}
 
     @staticmethod
-    def signal(row: dict, kind: str, now: datetime) -> dict:
+    def signal(row: dict, kind: str, now: datetime, extra: dict | None = None) -> dict:
         labels = {"rapid_rise": "急速拉升", "heavy_plunge": "放量跳水",
-                  "limit_up": "首次封板", "break_open": "炸板告警"}
-        direction = "bearish" if kind in {"heavy_plunge", "break_open"} else "bullish"
+                  "limit_up": "首次封板", "break_open": "炸板告警",
+                  "large_order_support": "大单托底", "suspected_active_buy": "疑似盘口扫货",
+                  "suspected_large_smash": "疑似大单砸盘"}
+        direction = "bearish" if kind in {"heavy_plunge", "break_open", "suspected_large_smash"} else "bullish"
         tags = [labels[kind]]
         details = []
         speed, ratio = row.get("speed_1m"), row.get("vol_ratio")
@@ -150,11 +251,21 @@ class Engine:
         reason = f"{now:%H:%M:%S} 触发【{labels[kind]}】"
         if details:
             reason += "，" + "，".join(details)
+        estimated = kind in {"suspected_active_buy", "suspected_large_smash"}
+        if kind in ORDERBOOK_SIGNALS:
+            details = [extra["summary"]] if extra else []
+            tags = [labels[kind]] + (["快照估算"] if estimated else ["五档买盘"])
+            reason = f"{now:%H:%M:%S} 触发【{labels[kind]}】" + ("(快照估算)" if estimated else "")
+            if details:
+                reason += "，" + "，".join(details)
         return {"direction": direction, "signal_type": kind, "signal_label": labels[kind],
                 "signal_tags": tags, "reason": reason,
+                "signal_estimated": estimated, "support_info": (extra or {}).get("support_info"),
+                "summary": (extra or {}).get("summary") or "，".join(details),
                 "speed_1m": speed, "window_1m_seconds": row.get("window_1m_seconds"),
                 "inflow_1m": row.get("inflow_1m"), "vol_ratio": ratio,
-                "alert_level": 3 if row.get("is_watchlist") or kind in {"limit_up", "break_open"} else 2}
+                "alert_level": (2 if row.get("is_watchlist") else 1) if kind in ORDERBOOK_SIGNALS else (
+                    3 if row.get("is_watchlist") or kind in {"limit_up", "break_open"} else 2)}
 
     def set_weights(self, weights: dict[str, float]) -> None:
         if set(weights) != set(DEFAULT_WEIGHTS):
@@ -222,7 +333,7 @@ class Engine:
         if minute != self.minute:
             self.minute, self.minute_count = minute, 0
             self.minute_counts = {"bullish": 0, "bearish": 0}
-        events, rows, vip_signals, conditions = [], {}, set(), {}
+        events, rows, active_signals = [], {}, {}
         thresholds = self.filters.snapshot()
         codes = {q.code for q in quotes}
         for code in list(self.anomalies):
@@ -236,6 +347,12 @@ class Engine:
             self.previous_condition.pop(code, None)
             self.watchlist_condition.pop(code, None)
             self.pending.discard(code)
+            self.orderbook_baselines.pop(code, None)
+            self.support_timers.pop(code, None)
+            self.orderbook_conditions.pop(code, None)
+            for key in list(self.signal_pending):
+                if key[0] == code:
+                    del self.signal_pending[key]
 
         def event(kind: str, q: Quote, **extra: object) -> None:
             events.append({"code": q.code, "name": q.name, "event_type": kind,
@@ -263,8 +380,7 @@ class Engine:
             speed = (q.price - old[1]) / q.pre_close * 100
             inflow = q.main_inflow - old[2]
             metrics = self.short_metrics(q, clock, reset)
-            ceiling = limit_price(q.pre_close)
-            floor = limit_price(q.pre_close, rate=-0.10)
+            ceiling, floor = stock_limit_prices(q.pre_close, q.name, now.date())
             at_limit = Decimal(str(q.price)) >= Decimal(str(ceiling))
             at_floor = Decimal(str(q.price)) <= Decimal(str(floor))
             state = self.limits.setdefault(q.code, LimitState())
@@ -305,6 +421,9 @@ class Engine:
                         "volume_threshold": thresholds["vol_ratio_threshold"],
                         "direction": None, "signal_type": None, "signal_label": None,
                         "signal_tags": [], "reason": None, "alert_level": 1, "score": None,
+                        "signal_estimated": False, "support_info": None,
+                        "outer_inner_ratio": round(q.outer_vol / q.inner_vol, 2)
+                        if q.outer_vol is not None and q.inner_vol is not None and q.inner_vol > 0 else None,
                         "is_limit_up": sealed, "at_limit_price": at_limit, "ever_limit_up": state.touched,
                         "first_seal_time": datetime.fromtimestamp(state.first_seal_ts, SHANGHAI).isoformat()
                         if state.first_seal_ts is not None else None,
@@ -335,94 +454,118 @@ class Engine:
                     direction = "bullish"
                 elif current_speed <= -thresholds["plunge_speed_threshold"] + 1e-9 and plunge_cash and not at_floor:
                     direction = "bearish"
-            conditions[q.code] = direction
+            if direction:
+                kind = "rapid_rise" if direction == "bullish" else "heavy_plunge"
+                active_signals[q.code, kind] = self.signal(row, kind, now)
+                previous = (self.watchlist_condition if vip else self.previous_condition).get(q.code)
+                if direction != previous and (vip or q.code not in self.anomalies or
+                        self.anomaly_signals.get(q.code, {}).get("signal_type") != kind):
+                    self.signal_pending[q.code, kind] = active_signals[q.code, kind]
             if vip:
-                if direction and direction != self.watchlist_condition.get(q.code):
-                    vip_signals.add(q.code)
                 self.watchlist_condition[q.code] = direction
-            previous_signal = self.anomaly_signals.get(q.code, {}).get("direction")
-            if direction and direction != self.previous_condition.get(q.code) and (
-                    q.code not in self.anomalies or previous_signal != direction):
-                self.pending.add(q.code)
-            if not direction:
-                self.pending.discard(q.code)
             self.previous_condition[q.code] = direction
+            book_signals = self.orderbook_signals(q, book, now, clock, reset, ceiling, floor, self.scan_allowed(row))
+            previous_book_signals = self.orderbook_conditions.get(q.code, set())
+            for kind, extra in book_signals.items():
+                info = self.signal(row, kind, now, extra)
+                active_signals[q.code, kind] = info
+                if kind not in previous_book_signals:
+                    self.signal_pending[q.code, kind] = info
+            self.orderbook_conditions[q.code] = set(book_signals)
 
-        # Separate candidate populations: bearish urgency cannot dilute bullish ranks.
+        # Re-evaluate pending conditions, never queue a burst after it has ended.
+        self.signal_pending = {key: active_signals[key] for key in self.signal_pending if key in active_signals}
+        scores = {}
         for direction in ("bullish", "bearish"):
-            cohort = {c: row for c, row in rows.items() if conditions[c] == direction}
+            members = {code for (code, _), signal in active_signals.items() if signal["direction"] == direction}
+            cohort = {code: rows[code] for code in members}
             if direction == "bullish":
                 metrics_by_weight = {"speed_2m": "speed_1m", "main_inflow": "main_inflow",
                                      "turnover": "turnover", "large_inflow": "large_inflow", "amount": "amount"}
                 values = {c: {key: row[metric] for key, metric in metrics_by_weight.items()}
                           for c, row in cohort.items()}
             else:
-                # Keep the five-key weight API; bearish slots mean speed, net
-                # outflow, turnover, volume ratio and amount respectively.
-                values = {c: {"speed_2m": abs(row["speed_1m"]), "main_inflow": max(0, -row["inflow_1m"]),
-                              "turnover": row["turnover"], "large_inflow": row["vol_ratio"],
-                              "amount": row["amount"]} for c, row in cohort.items()}
+                values = {c: {"speed_2m": abs(row["speed_1m"]) if row["speed_1m"] is not None else None,
+                              "main_inflow": max(0, -row["inflow_1m"]), "turnover": row["turnover"],
+                              "large_inflow": row["vol_ratio"], "amount": row["amount"]} for c, row in cohort.items()}
                 for code, row in cohort.items():
                     if row["is_watchlist"] and row["inflow_1m"] >= 0:
                         values[code]["main_inflow"] = max(0, -row["main_inflow"])
             ranks = {metric: percentiles({c: v[metric] for c, v in values.items() if v[metric] is not None})
                      for metric in self.weights}
-            for code, row in cohort.items():
-                available = sum(weight for metric, weight in self.weights.items() if code in ranks[metric])
-                row["score"] = round(sum(ranks[m][code] * w for m, w in self.weights.items()
-                                         if code in ranks[m]) / available, 2) if available else 50.0
-                kind = "rapid_rise" if direction == "bullish" else "heavy_plunge"
-                row.update(self.signal(row, kind, now))
-        candidates = sorted((c for c in self.pending if c in rows and conditions[c] and
-                             (c not in self.anomalies or self.anomaly_signals.get(c, {}).get("direction") != conditions[c])),
-                            key=lambda c: (-rows[c]["score"], c))
-        vip = [c for c in candidates if c in self.watchlist]
-        ordinary = [c for c in candidates if c not in self.watchlist]
-        normal = []
+            for code in cohort:
+                available = sum(w for m, w in self.weights.items() if code in ranks[m])
+                scores[code, direction] = round(sum(ranks[m][code] * w for m, w in self.weights.items()
+                                                    if code in ranks[m]) / available, 2) if available else 50.0
+        for (code, kind), signal in active_signals.items():
+            signal["score"] = scores[code, signal["direction"]]
+        active_by_code = {}
+        for (code, _), info in active_signals.items():
+            active_by_code.setdefault(code, []).append(info)
+        for code, current in active_by_code.items():
+            rows[code].update(max(current, key=lambda info: (info["alert_level"], SIGNAL_PRIORITY[info["signal_type"]],
+                                                           info["direction"] == "bearish")))
+
+        # Quotas count stock admission, not each timeline item. A new signal on
+        # an already admitted same-direction card updates it without resetting TTL.
+        accepted_pairs = set()
         for direction in ("bullish", "bearish"):
-            admitted = [c for c in ordinary if conditions[c] == direction][
-                :max(0, self.cfg.max_new_per_minute - self.minute_counts[direction])]
-            normal.extend(admitted)
-            self.minute_counts[direction] += len(admitted)
-        normal.sort(key=lambda c: (-rows[c]["score"], c))
-        accepted = vip + normal
-        # Reverse insertion keeps the strongest of a simultaneous batch at the top.
-        for code in reversed(accepted):
+            candidates = {code for (code, _), signal in self.signal_pending.items() if signal["direction"] == direction}
+            for code in sorted(candidates, key=lambda c: (c not in self.watchlist, -scores[c, direction], c)):
+                existing = code in self.anomalies and self.anomaly_signals.get(code, {}).get("direction") == direction
+                if code in self.watchlist or existing:
+                    accepted_pairs.add((code, direction))
+                elif self.minute_counts[direction] < self.cfg.max_new_per_minute:
+                    self.minute_counts[direction] += 1
+                    accepted_pairs.add((code, direction))
+        accepted_signals = {key: info for key, info in self.signal_pending.items()
+                            if (key[0], info["direction"]) in accepted_pairs}
+        representatives = {}
+        for (code, _), info in accepted_signals.items():
+            old = representatives.get(code)
+            rank = lambda item: (item["alert_level"], SIGNAL_PRIORITY[item["signal_type"]], item["direction"] == "bearish")
+            if old is None or rank(info) > rank(old):
+                representatives[code] = info
+        fresh = sorted((code for code, info in representatives.items() if code not in self.anomalies or
+                        self.anomaly_signals.get(code, {}).get("direction") != info["direction"]),
+                       key=lambda c: (c not in self.watchlist, -representatives[c]["score"], c))
+        for code in reversed(fresh):
             self.anomalies[code] = Entry(clock, now.isoformat())
             self.anomalies.move_to_end(code, last=False)
-            self.pending.discard(code)
-            self.anomaly_signals[code] = {**self.signal(rows[code], rows[code]["signal_type"], now),
-                                          "score": rows[code]["score"]}
-        self.minute_count = self.minute_counts["bullish"]
+        self.anomaly_signals.update(representatives)
         by_code = {q.code: q for q in quotes}
-        for code in accepted:
-            if code not in self.watchlist:
-                event("anomaly", by_code[code], score=rows[code]["score"],
-                      speed_2m=rows[code]["speed_2m"], inflow_2m=rows[code]["inflow_2m"])
-        for code in sorted(vip_signals, key=lambda code: (-rows[code]["score"], code)):
-            event("anomaly", by_code[code], score=rows[code]["score"],
-                  speed_2m=rows[code]["speed_2m"], inflow_2m=rows[code]["inflow_2m"])
+        for (code, kind), info in sorted(accepted_signals.items(), key=lambda item: (
+                item[0][0] not in self.watchlist, item[0][0], SIGNAL_PRIORITY[item[0][1]])):
+            event("anomaly", by_code[code], score=info["score"], speed_2m=rows[code]["speed_2m"],
+                  inflow_2m=rows[code]["inflow_2m"], **{k: v for k, v in info.items() if k != "score"})
+            self.signal_pending.pop((code, kind), None)
+        self.pending = {code for code, _ in self.signal_pending}
+        self.minute_count = self.minute_counts["bullish"]
         for item in events:
-            row = rows[item["code"]]
-            kind = ("rapid_rise" if conditions[item["code"]] == "bullish" else "heavy_plunge") if (
-                item["event_type"] == "anomaly") else item["event_type"]
-            item.update(self.signal(row, kind, now))
             if item["event_type"] != "anomaly":
-                row.update(self.signal(row, kind, now))
+                item.update(self.signal(rows[item["code"]], item["event_type"], now))
+                rows[item["code"]].update(self.signal(rows[item["code"]], item["event_type"], now))
+        for item in sorted(events, key=lambda item: (item["alert_level"], SIGNAL_PRIORITY[item["signal_type"]])):
+            self.timelines.setdefault(item["code"], deque(maxlen=12)).append({
+                "time": now.strftime("%H:%M:%S"), "direction": item["direction"], "signal_type": item["signal_type"],
+                "signal_label": item["signal_label"], "price": item["price"], "change_pct": item["pct"],
+                "summary": item["summary"], "is_estimated": item["signal_estimated"]})
         # Missing a code is not evidence of expiry or a limit-up. Keep its last
         # displayed values without feeding stale rows into fresh-market ranks.
         retained = {code: {**self.rows[code], "quote_missing": True}
                     for code in set(self.anomalies) | self.watchlist if code not in rows and code in self.rows}
         self.rows = {**retained, **rows}
-        for item in reversed(events):
-            code = item["code"]
-            if item["is_watchlist"]:
-                self.watchlist_events[code] = Entry(clock, now.isoformat())
-                self.watchlist_events.move_to_end(code, last=False)
-                self.watchlist_kinds[code] = item["event_type"]
-                self.watchlist_signals[code] = {key: item[key] for key in (
-                    "direction", "signal_type", "signal_label", "signal_tags", "reason", "speed_1m",
-                    "window_1m_seconds", "inflow_1m", "vol_ratio", "alert_level")}
+        for code in {item["code"] for item in events if item["is_watchlist"]}:
+            choices = [item for item in events if item["code"] == code and item["is_watchlist"]]
+            item = max(choices, key=lambda event: (event["alert_level"], SIGNAL_PRIORITY[event["signal_type"]]))
+            self.watchlist_events[code] = Entry(clock, now.isoformat())
+            self.watchlist_events.move_to_end(code, last=False)
+            self.watchlist_kinds[code] = item["event_type"]
+            self.watchlist_signals[code] = {key: item[key] for key in (
+                "direction", "signal_type", "signal_label", "signal_tags", "reason", "speed_1m", "summary",
+                "window_1m_seconds", "inflow_1m", "vol_ratio", "alert_level", "signal_estimated", "support_info")}
+        for code, row in self.rows.items():
+            row["timeline"] = self.timeline(code)
         board = self.anomaly_board(clock)
         sealed = sorted((row for row in rows.values() if row["is_limit_up"]),
                         key=lambda row: (row["first_seal_ts"], row["code"]))

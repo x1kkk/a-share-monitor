@@ -2,8 +2,10 @@
 from __future__ import annotations
 
 import os
+import math
 from dataclasses import asdict, dataclass, field
-from datetime import timedelta, timezone
+from datetime import date, timedelta, timezone
+from decimal import Decimal, ROUND_HALF_UP
 
 SHANGHAI = timezone(timedelta(hours=8), name="Asia/Shanghai")
 MOCK_MODE: bool = False
@@ -23,12 +25,25 @@ SENSITIVITY_PRESETS = {
 }
 
 
+def stock_limit_prices(pre_close: float, name: str, today: date) -> tuple[float, float]:
+    # SSE/SZSE 2026 trading rules took effect on July 6: main-board ST moved
+    # from 5% to 10%. Historical samples must retain their original 5% limits.
+    rate = Decimal("0.05") if "ST" in name.upper() and today < date(2026, 7, 6) else Decimal("0.10")
+    previous, tick = Decimal(str(pre_close)), Decimal("0.01")
+    upper = (previous * (1 + rate)).quantize(tick, rounding=ROUND_HALF_UP)
+    lower = (previous * (1 - rate)).quantize(tick, rounding=ROUND_HALF_UP)
+    return float(max(previous + tick, upper)), float(max(tick, min(previous - tick, lower)))
+
+
 @dataclass(frozen=True)
 class FilterSettings:
     sensitivity: str = "balanced"
     exclude_st: bool = False
     exclude_low_amount: bool = False
     min_daily_amount: int = 100_000_000
+    enable_orderbook_signals: bool = True
+    support_min_amount_wan: float = 1000.0
+    burst_min_amount_wan: float = 500.0
 
     def __post_init__(self):
         if not isinstance(self.sensitivity, str) or self.sensitivity not in SENSITIVITY_PRESETS:
@@ -37,6 +52,11 @@ class FilterSettings:
             raise ValueError("filter switches must be booleans")
         if type(self.min_daily_amount) is not int or not 0 <= self.min_daily_amount <= 1_000_000_000_000:
             raise ValueError("min_daily_amount must be an integer in 0..1000000000000")
+        if type(self.enable_orderbook_signals) is not bool:
+            raise ValueError("enable_orderbook_signals must be boolean")
+        for value in (self.support_min_amount_wan, self.burst_min_amount_wan):
+            if type(value) not in (int, float) or not math.isfinite(value) or not 0 < value <= 1_000_000:
+                raise ValueError("orderbook thresholds must be finite numbers in (0, 1000000] wan")
 
     def snapshot(self) -> dict:
         return {**asdict(self), **SENSITIVITY_PRESETS[self.sensitivity]}
